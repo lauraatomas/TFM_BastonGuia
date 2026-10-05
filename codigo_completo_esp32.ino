@@ -1,6 +1,5 @@
 /*
   MAPLESS CANE - ESP32-S3 FULL HARDWARE v4
-  SERVO CALIBRATED + HAPTICA LOCAL SUPERIOR/LATERAL
   =========================================
 
   Distribución:
@@ -16,23 +15,18 @@
     SERVO              : GPIO17
     ERM DERECHO       : GPIO18
 
-  IMPORTANTE:
-  Esta asignación supone que físicamente has conectado los motores así.
-  Si tus cuatro motores están en otros GPIO, cambia SOLO las constantes
-  VIB_TOP_PIN / VIB_BOTTOM_PIN / VIB_LEFT_PIN / VIB_RIGHT_PIN.
-
   IMPORTANTE ELÉCTRICO:
-  - Los ECHO del HC-SR04 son de 5 V: usar divisor resistivo/level shifter
+  - Los ECHO del HC-SR04 son de 5 V: se ha usado un divisor resistivo/level shifter
     hacia GPIO del ESP32 (3,3 V).
   - Los motores ERM NO se conectan directamente a GPIO. Cada motor necesita
-    transistor/MOSFET, diodo de rueda libre si corresponde y alimentación
+    resistencias, diodo de rueda libre si corresponde y alimentación
     acorde a la tensión nominal del motor. Masa común con ESP32.
   - El servo usa alimentación externa regulada de 6 V; solo la señal va al
     GPIO17. Masa común ESP32 <-> fuente del servo.
-  - El MPU-6050 se conecta a 3,3 V si el breakout lo permite; SDA/SCL son 3,3 V.
+  - El MPU-6050 se conecta a 3,3 V; SDA/SCL son 3,3 V.
 
   Arquitectura:
-  - Raspberry: percepción, navegación y ángulo final.
+  - Raspberry: percepción, navegación (algoritmo de control) y ángulo final.
   - ESP32: sensores, botones, IMU, haptics y PWM del servo.
   - La persona empuja y detiene físicamente el bastón. No existe freno.
 
@@ -52,7 +46,7 @@
     No vuelve a avisar hasta que el lado queda libre (> 55 cm, configurable).
 
   - Los eventos hápticos semánticos de Raspberry (giro, obstáculo durante
-    evasión, fin de maniobra) se mantienen sin cambios.
+    evasión, fin de maniobra) también se van notificando.
 
   Protocolo serie ESP32 -> Raspberry:
     TEL2,seq,uptime_ms,
@@ -81,8 +75,7 @@
     +0.50 rad -> 2500 us
 
   IMPORTANTE:
-  El servo se controla con la librería ESP32Servo, exactamente igual que en
-  el sketch simple que sí mueve físicamente el servo.
+  El servo se controla con la librería ESP32Servo.
 */
 
 #include <Arduino.h>
@@ -163,8 +156,6 @@ static constexpr uint16_t ULTRASONIC_MAX_MM = 2800;
 //   - alerta a <= 0,40 m tras 2 lecturas válidas consecutivas;
 //   - se rearma al quedar >= 0,55 m (o sin eco) durante 3 lecturas;
 //   - cada entrada genera solo UN doble pulso en el lado correspondiente.
-//
-// Los umbrales son parámetros de partida para pruebas reales.
 // -----------------------------------------------------------------------------
 static constexpr uint16_t UPPER_ALERT_ON_MM = 800;
 static constexpr uint16_t UPPER_ALERT_OFF_MM = 950;
@@ -335,7 +326,6 @@ static bool attachServoPwm() {
 static void attachVibrationOutput(uint8_t pin) {
   // NO usamos LEDC para los ERM.
   // ESP32Servo ya utiliza LEDC internamente para generar los 50 Hz del servo.
-  // Los vibradores se controlan únicamente ON/OFF a través de sus MOSFET.
   pinMode(pin, OUTPUT);
   digitalWrite(pin, LOW);
 }
@@ -457,8 +447,6 @@ static void setVibrationPower(
 // - superior: aviso local único + segundo aviso si se acerca mucho;
 // - laterales: doble pulso local al entrar a <= 40 cm, independiente
 //   de la máquina de estados, con rearme al quedar > 55 cm.
-//
-// Los eventos 1..7 de Raspberry siguen conservando exactamente su significado.
 //
 // IMPORTANTE:
 // Los eventos 1..7 son "one-shot". Si Raspberry mantiene, por ejemplo,
@@ -1488,7 +1476,7 @@ static bool configureAndVerifyMpu6050(
 }
 
 static bool initMpu6050() {
-  // Al encender, algunos módulos necesitan un pequeño margen antes de
+  // CALIBRACIÓN: Al encender, algunos módulos necesitan un pequeño margen antes de
   // aceptar de forma fiable las escrituras de configuración.
   delay(100);
 
@@ -1632,7 +1620,7 @@ static ImuReading readMpu6050() {
 }
 
 // -----------------------------------------------------------------------------
-// Serie
+// Serie - COMUNICACIÓN con la Raspberry
 // -----------------------------------------------------------------------------
 static void processCommandLine(
   const char *line
