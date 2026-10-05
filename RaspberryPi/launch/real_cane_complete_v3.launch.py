@@ -5,14 +5,10 @@ ARRANQUE COMPLETO V3 DEL BASTÓN REAL.
 Un único comando arranca:
   - el real_cane_full.launch.py ya existente (RealSense, odometría, planner,
     controlador de evasión, steering mux, bridge ESP32, etc.)
-  - el nuevo coordinador háptico V3
 
 Uso:
     ros2 launch mapless_cane_real real_cane_complete_v3.launch.py \
       serial_device:=/dev/ttyACM0
-
-No sustituye la lógica de navegación que ya funciona: la incluye y añade
-únicamente la coordinación háptica nueva.
 """
 
 import os
