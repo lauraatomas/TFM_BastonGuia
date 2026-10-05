@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
-"""Robust mapless bypass controller for a user-pushed robotic cane.
+"""Controlador robusto de evasión sin mapa para un bastón robótico impulsado
+por el propio usuario.
 
-Version 10 keeps the real hardware constraint: the cane has no brake.  The user
-continues to provide propulsion and the controller can only steer the front
-wheel and request haptic warnings.
+El bastón no dispone de freno. El usuario continúa proporcionando la propulsión y el controlador solo
+puede modificar la dirección de la rueda delantera y solicitar avisos hápticos.
 
-The state machine borrows the safeguards that worked in the former odometry-
-based controller, but all geometry now uses /local_odom and collision-checked
-local arcs.  Important protections are:
+La máquina de estados incorpora las salvaguardas que resultaron útiles en el
+controlador previo basado en odometría, pero toda la geometría utiliza ahora
+/local_odom y arcos locales previamente comprobados frente a colisiones. Las
+principales protecciones son:
 
-* a side sensor does not "see" the obstacle merely because its absolute range
-  is below a threshold; it must show a persistent drop from the baseline taken
-  at the beginning of the current manoeuvre;
-* the obstacle cannot be declared lost until it was genuinely seen and the
-  release condition persists;
-* the transition to PASS_OBSTACLE is not allowed solely because a side sensor
-  is invalid;
-* a short-lived obstacle track captured from the RGB-D planner is used when the
-  obstacle leaves the frontal field of view;
-* while the tracked obstacle is not behind the robot, steering towards it is
-  forbidden and a minimum away/parallel command is maintained;
-* return to the captured line starts only after positive evidence that the
-  complete robot has passed the obstacle.
+* un sensor lateral no considera que ha detectado el obstáculo únicamente porque
+  su distancia absoluta esté por debajo de un umbral; debe observarse además una
+  caída persistente respecto a la línea base tomada al inicio de la maniobra;
+* el obstáculo no puede declararse perdido hasta que haya sido realmente detectado
+  y la condición de liberación se mantenga durante un tiempo suficiente;
+* la transición a PASS_OBSTACLE no se permite únicamente porque un sensor lateral
+  pase a ser inválido;
+* se utiliza una referencia de obstáculo de corta duración procedente del planner
+  RGB-D cuando el obstáculo abandona el campo de visión frontal;
+* mientras el obstáculo seguido no haya quedado detrás del robot, se prohíbe girar
+  hacia él y se mantiene una orden mínima de alejamiento o paralelismo;
+* el retorno a la línea de referencia solo comienza cuando existe evidencia
+  positiva de que el robot completo ha superado el obstáculo.
 """
+
+# ============================================================================
+# Importaciones
+# ============================================================================
+# El controlador combina lógica de máquina de estados, geometría planar,
+# selección de trayectorias locales y comunicación ROS 2.
+# ============================================================================
 
 from __future__ import annotations
 
@@ -40,19 +48,34 @@ from std_msgs.msg import (
 from std_srvs.srv import Trigger
 
 
+# Limita un valor al intervalo indicado para mantener órdenes y magnitudes
+# dentro de rangos seguros.
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+# Normaliza un ángulo al intervalo [-pi, pi].
+
 def wrap_angle(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
+
+# Extrae el ángulo de guiñada de un cuaternión de orientación ROS.
 
 def yaw_from_quaternion(q) -> float:
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
+
+# ============================================================================
+# Representación de un arco candidato
+# ============================================================================
+# Cada candidato recibido del planner contiene dirección, validez, clearance,
+# cobertura observada, distancia de colisión y métricas adicionales usadas en
+# la selección de la trayectoria.
+# ============================================================================
 
 @dataclass
 class ArcCandidate:
@@ -65,6 +88,13 @@ class ArcCandidate:
     far_clearance: float
     tail_clearance: float
 
+
+# ============================================================================
+# Controlador principal de evasión
+# ============================================================================
+# Implementa una máquina de estados que mantiene siempre la prioridad del
+# usuario y solo interviene sobre la dirección cuando existe riesgo u obstáculo.
+# ============================================================================
 
 class MaplessBypassControllerNode(Node):
     USER_GUIDED = 'USER_GUIDED'
@@ -87,6 +117,11 @@ class MaplessBypassControllerNode(Node):
     def __init__(self) -> None:
         super().__init__('mapless_bypass_controller_node')
 
+        # ------------------------------------------------------------------
+        # Interfaces ROS y temporización
+        # ------------------------------------------------------------------
+        # Define topics de odometría, dirección, interacción humana, latidos de
+        # hardware y temporizaciones de control y vigilancia.
         # Interfaces and timing.
         self.declare_parameter('odom_topic', '/local_odom')
         self.declare_parameter('steering_output_topic', '/assist_steering_cmd')
@@ -120,6 +155,11 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('initial_route_capture_enabled', True)
         self.declare_parameter('initial_route_capture_delay_s', 0.35)
 
+        # ------------------------------------------------------------------
+        # Geometría del robot y límites del servo
+        # ------------------------------------------------------------------
+        # Estos parámetros fijan dimensiones, margen de seguridad y límites de
+        # magnitud y velocidad de cambio de la dirección.
         # Robot and servo.
         self.declare_parameter('wheelbase_m', 0.275)
         self.declare_parameter('robot_width_m', 0.30)
@@ -128,12 +168,22 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('max_steer_rate_rad_s', 1.30)
         self.declare_parameter('steer_filter_tau_s', 0.08)
 
+        # ------------------------------------------------------------------
+        # Estimación de trayectoria estable del usuario
+        # ------------------------------------------------------------------
+        # Antes de una evasión se identifica un tramo de avance suficientemente
+        # recto para definir una línea de referencia persistente.
         # Stable user trajectory before the obstacle.
         self.declare_parameter('stable_heading_yaw_rate_rad_s', 0.18)
         self.declare_parameter('stable_heading_min_speed_m_s', 0.04)
         self.declare_parameter('stable_heading_time_s', 0.28)
         self.declare_parameter('stable_heading_max_age_s', 2.0)
 
+        # ------------------------------------------------------------------
+        # Detección frontal e inicio de evasión
+        # ------------------------------------------------------------------
+        # Regula cuándo se activa la asistencia y cómo se abre progresivamente
+        # la trayectoria para separarse del obstáculo.
         # Detection and opening.
         self.declare_parameter('minimum_trigger_distance_m', 0.75)
         self.declare_parameter('emergency_distance_m', 0.38)
@@ -155,6 +205,11 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('front_clear_confirm_s', 0.24)
         self.declare_parameter('pass_entry_obstacle_x_m', 0.45)
 
+        # ------------------------------------------------------------------
+        # Selección del lado de evasión
+        # ------------------------------------------------------------------
+        # La decisión izquierda/derecha se basa en la calidad global de cada
+        # corredor y puede cambiar antes de que la maniobra quede comprometida.
         # Compare complete left/right corridor quality.  The selected side may
         # still change before commitment when the opposite gap is clearly wider.
         self.declare_parameter('side_summary_timeout_s', 1.20)
@@ -170,6 +225,11 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('side_choice_line_bias_weight', 0.55)
         self.declare_parameter('side_choice_line_bias_score_window', 0.85)
 
+        # ------------------------------------------------------------------
+        # Detección lateral relativa a línea base
+        # ------------------------------------------------------------------
+        # Los sensores laterales deben mostrar una caída real respecto a la
+        # distancia inicial para confirmar que el obstáculo está siendo bordeado.
         # Baseline-relative side detection.  The release threshold is deliberately
         # above the absolute detection threshold, creating real hysteresis.
         self.declare_parameter('side_seen_drop_m', 0.18)
@@ -193,6 +253,11 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('side_soft_distance_m', 0.38)
         self.declare_parameter('side_keepaway_steer_rad', 0.12)
 
+        # ------------------------------------------------------------------
+        # Superación del obstáculo
+        # ------------------------------------------------------------------
+        # Durante PASS_OBSTACLE se mantiene separación lateral y se utiliza la
+        # memoria geométrica de corta duración como evidencia complementaria.
         # Passing with short-lived obstacle memory.
         self.declare_parameter('pass_hold_away_steer_rad', 0.11)
         self.declare_parameter('pass_max_toward_object_steer_rad', 0.02)
@@ -201,6 +266,11 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('pass_unconfirmed_warning_progress_m', 1.45)
         self.declare_parameter('tracked_obstacle_min_quality', 0.25)
 
+        # ------------------------------------------------------------------
+        # Retorno a la línea de referencia
+        # ------------------------------------------------------------------
+        # Una vez superado el obstáculo se calcula una reentrada progresiva hacia
+        # la línea previamente capturada.
         # Return to the frozen local line.
         self.declare_parameter('return_lookahead_min_m', 0.50)
         self.declare_parameter('return_lookahead_speed_gain_s', 0.65)
@@ -238,6 +308,11 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('return_detour_max_extra_lateral_m', 0.30)
         self.declare_parameter('return_detour_parallel_steer_rad', 0.06)
 
+        # ------------------------------------------------------------------
+        # Límite de giro autónomo
+        # ------------------------------------------------------------------
+        # El bastón no debe ejecutar por sí solo un giro amplio o cambio de rumbo.
+        # Si la desviación angular aumenta demasiado, la asistencia se limita.
         # A passive cane must never autonomously perform a U-turn.  The guard
         # only limits the servo; it does not brake or remove propulsion from
         # the user.  Larger route changes remain exclusive to MANUAL_TURN.
@@ -246,6 +321,11 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('autonomous_turn_unwind_steer_rad', 0.18)
         self.declare_parameter('autonomous_turn_front_guard_m', 0.48)
 
+        # ------------------------------------------------------------------
+        # Selección de arcos candidatos
+        # ------------------------------------------------------------------
+        # Combina cercanía al comando deseado, clearance, observación, distancia
+        # de colisión y continuidad respecto al comando anterior.
         # Candidate selection.
         self.declare_parameter('desired_steer_weight', 2.8)
         self.declare_parameter('clearance_reward_weight', 0.90)
@@ -261,10 +341,15 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('emergency_side_hard_m', 0.26)
         self.declare_parameter('emergency_min_escape_steer_rad', 0.20)
 
+        # El latido de hardware puede exigirse en el sistema real y desactivarse
+        # durante simulación.
         # Hardware heartbeat is optional in simulation.
         self.declare_parameter('require_hardware_alive', False)
         self.declare_parameter('hardware_timeout_s', 0.50)
 
+        # ------------------------------------------------------------------
+        # Lectura y almacenamiento de parámetros ROS
+        # ------------------------------------------------------------------
         # Read parameters.
         gp = lambda name: self.get_parameter(name).value
         self.odom_topic = str(gp('odom_topic'))
@@ -415,6 +500,9 @@ class MaplessBypassControllerNode(Node):
         self.require_hardware_alive = bool(gp('require_hardware_alive'))
         self.hardware_timeout_s = float(gp('hardware_timeout_s'))
 
+        # ------------------------------------------------------------------
+        # Estado de pose, entradas humanas y percepción
+        # ------------------------------------------------------------------
         # Pose and input state.
         self.x = 0.0
         self.y = 0.0
@@ -435,6 +523,7 @@ class MaplessBypassControllerNode(Node):
         self.trigger_distance = self.minimum_trigger_distance_m
         self.arc_emergency = False
 
+        # Resumen agregado de la calidad de los corredores izquierdo y derecho.
         # Planner side summary: left/right aggregate scores, far and tail gap
         # clearances, best steering and viable fractions.
         self.side_summary = [-1e6, -1e6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -452,6 +541,8 @@ class MaplessBypassControllerNode(Node):
         self.side_left_clear = False
         self.side_right_clear = False
 
+        # Estado del obstáculo seguido por el planner y copia bloqueada al inicio
+        # de la maniobra para mantener una referencia consistente.
         # Current obstacle track from planner and locked track for the manoeuvre.
         self.track_valid = False
         self.track_x_local = 0.0
@@ -464,6 +555,7 @@ class MaplessBypassControllerNode(Node):
         self.locked_obstacle_y_local = 0.0
         self.locked_obstacle_radius = 0.0
 
+        # Línea de referencia del tramo actual y memoria de rumbo estable.
         # Reference line and stable heading.
         self.line_valid = False
         self.line_x0 = 0.0
@@ -486,6 +578,8 @@ class MaplessBypassControllerNode(Node):
         self.initial_route_captured = False
         self.initial_route_ready_since: Optional[float] = None
 
+        # Estado dedicado al giro manual: durante esta fase el usuario tiene
+        # prioridad exclusiva y la línea previa deja de ser válida.
         # Explicit manual-turn/rebase state.  A route line is never replaced by
         # an obstacle; only startup and a completed human turn may create one.
         self.manual_turn_started_at: Optional[float] = None
@@ -495,6 +589,7 @@ class MaplessBypassControllerNode(Node):
         self.manual_turn_post_reset_until: Optional[float] = None
         self.manual_turn_waiting_for_fresh_odom = False
 
+        # Estado actual de la máquina y memoria temporal específica de la maniobra.
         # State machine and per-manoeuvre memory.
         self.state = self.USER_GUIDED
         self.state_start_time = self.now_seconds()
@@ -553,6 +648,11 @@ class MaplessBypassControllerNode(Node):
         self.haptic_latch_pattern = self.HAPTIC_NONE
         self.last_haptic_reported = -1
 
+        # ------------------------------------------------------------------
+        # Suscripciones ROS 2
+        # ------------------------------------------------------------------
+        # Reciben odometría, percepción del planner, sensores laterales, órdenes
+        # humanas y estado del hardware.
         # Subscriptions.
         self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 10)
         self.create_subscription(Bool, '/local_odom_valid', self.odom_valid_callback, 10)
@@ -574,6 +674,11 @@ class MaplessBypassControllerNode(Node):
         self.create_subscription(Bool, '/side_right_clear', self.side_right_clear_callback, 10)
         self.create_subscription(Bool, '/hardware_alive', self.hardware_alive_callback, 10)
 
+        # ------------------------------------------------------------------
+        # Publicadores ROS 2
+        # ------------------------------------------------------------------
+        # Se publican dirección asistida, háptica, avisos de seguridad, estado de
+        # la máquina y distintas variables de diagnóstico geométrico.
         # Publishers.
         self.steering_pub = self.create_publisher(Float64, self.steering_output_topic, 10)
         self.haptic_pub = self.create_publisher(UInt8, '/haptic_pattern', 10)
@@ -609,6 +714,9 @@ class MaplessBypassControllerNode(Node):
             'used as complementary evidence rather than a permanent return lock.'
         )
 
+    # =========================================================================
+    # Callbacks de entrada
+    # =========================================================================
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
@@ -636,6 +744,7 @@ class MaplessBypassControllerNode(Node):
     def manual_turn_active_callback(self, msg: Bool) -> None:
         self.manual_turn_active = bool(msg.data)
 
+    # Convierte el array plano recibido del planner en estructuras ArcCandidate.
     def candidates_callback(self, msg: Float32MultiArray) -> None:
         data = list(msg.data)
         if len(data) % self.CANDIDATE_WIDTH != 0:
@@ -678,6 +787,7 @@ class MaplessBypassControllerNode(Node):
     def emergency_callback(self, msg: Bool) -> None:
         self.arc_emergency = bool(msg.data)
 
+    # Actualiza la referencia del obstáculo frontal seguido por el planner.
     def track_callback(self, msg: Float32MultiArray) -> None:
         data = list(msg.data)
         if len(data) < self.TRACK_WIDTH:
@@ -714,9 +824,19 @@ class MaplessBypassControllerNode(Node):
         self.hardware_alive = bool(msg.data)
         self.hardware_alive_stamp = self.now_seconds()
 
+    # =========================================================================
+    # Bucle principal de control
+    # =========================================================================
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+    # Ejecuta el ciclo de control:
+    #   1. actualiza referencias y errores;
+    #   2. comprueba frescura de percepción, odometría y hardware;
+    #   3. respeta prioridad manual;
+    #   4. ejecuta la lógica de la máquina de estados;
+    #   5. limita y filtra la dirección;
+    #   6. publica dirección, háptica y avisos.
     def control_callback(self) -> None:
         now = self.get_clock().now()
         now_sec = self.now_seconds()
@@ -728,6 +848,7 @@ class MaplessBypassControllerNode(Node):
         self.update_stable_heading(now_sec)
         self.update_line_errors()
 
+        # Verificación de frescura de la percepción procedente del planner.
         perception_fresh = (
             self.candidates_stamp is not None
             and (now_sec - self.candidates_stamp) <= self.sensor_timeout_s
@@ -737,12 +858,14 @@ class MaplessBypassControllerNode(Node):
             self.odom_stamp is not None
             and (now_sec - self.odom_stamp) <= self.odom_timeout_s
         )
+        # Odometría considerada plenamente fiable para control geométrico.
         localization_good = (
             self.have_odom
             and odom_fresh
             and self.odom_valid
             and self.odom_confidence >= self.min_odom_confidence
         )
+        # Umbral más permisivo usado para conservar referencias de trayectoria.
         localization_usable = (
             self.have_odom
             and odom_fresh
@@ -777,6 +900,8 @@ class MaplessBypassControllerNode(Node):
             and self.hardware_alive
         )
 
+        # Un giro manual explícito o una orden humana suficientemente grande
+        # fuerza la transición al estado MANUAL_TURN.
         explicit_turn = self.manual_turn_active
         fallback_turn = (
             self.state != self.MANUAL_TURN
@@ -878,6 +1003,8 @@ class MaplessBypassControllerNode(Node):
                     now_sec, localization_good
                 )
 
+        # Limitación final del objetivo y aplicación de salvaguarda frente a
+        # giros autónomos excesivos.
         target = clamp(target, -self.max_steer_rad, self.max_steer_rad)
         target = self.apply_autonomous_turn_guard(target, assist_active, now_sec)
         self.theta_cmd = self.rate_limited_filter(target, self.theta_cmd, dt)
@@ -940,9 +1067,14 @@ class MaplessBypassControllerNode(Node):
             self.get_logger().info(debug)
             self.last_debug_time = now
 
+    # =========================================================================
+    # Máquina de estados
+    # =========================================================================
     # ------------------------------------------------------------------
     # State machine
     # ------------------------------------------------------------------
+    # Implementa la lógica principal de transición y control para los estados:
+    # USER_GUIDED, AVOID_OPEN, PASS_OBSTACLE y RETURN_LINE.
     def compute_state_control(self, now_sec: float, localization_good: bool) -> tuple[float, str, bool]:
         straight = self.straight_candidate()
         straight_observed = straight is not None and straight.observed_ratio >= self.min_straight_observed_ratio
@@ -955,6 +1087,9 @@ class MaplessBypassControllerNode(Node):
             and self.front_collision_distance < self.emergency_distance_m
         )
 
+        # USER_GUIDED:
+        # el usuario controla dirección y velocidad; la asistencia solo se activa
+        # si aparece un obstáculo dentro de la distancia de disparo.
         if self.state == self.USER_GUIDED:
             if not straight_observed and not obstacle_near:
                 self.set_warning('STRAIGHT_CORRIDOR_INSUFFICIENTLY_OBSERVED')
@@ -989,6 +1124,9 @@ class MaplessBypassControllerNode(Node):
             self.latch_haptic(self.HAPTIC_DANGER, 0.40)
             return self.compute_emergency_escape_command(), 'WARN_NO_VALID_ARC_EMERGENCY_ESCAPE', True
 
+        # AVOID_OPEN:
+        # apertura progresiva de la trayectoria hacia el lado elegido hasta
+        # confirmar que el obstáculo está siendo correctamente bordeado.
         if self.state == self.AVOID_OPEN:
             self.update_side_seen(now_sec)
             self.update_side_exit_evidence(now_sec)
@@ -1069,6 +1207,9 @@ class MaplessBypassControllerNode(Node):
                 )
             return command, phase, True
 
+        # PASS_OBSTACLE:
+        # mantiene una trayectoria paralela o alejada hasta confirmar que la parte
+        # trasera del obstáculo ha quedado completamente detrás del robot.
         if self.state == self.PASS_OBSTACLE:
             self.update_side_seen(now_sec)
             self.update_side_exit_evidence(now_sec)
@@ -1102,6 +1243,9 @@ class MaplessBypassControllerNode(Node):
 
             return self.compute_pass_command(now_sec), 'PASS_HOLD_UNTIL_OBJECT_BEHIND', True
 
+        # RETURN_LINE:
+        # corrige progresivamente error lateral y angular hasta recuperar la línea
+        # de referencia original del tramo.
         if self.state == self.RETURN_LINE:
             if obstacle_near and self.front_collision_distance < self.return_replan_front_m:
                 if self.start_avoidance(now_sec, keep_reference_line=True):
@@ -1147,9 +1291,14 @@ class MaplessBypassControllerNode(Node):
         self.release_to_user(now_sec, reason='UNKNOWN_STATE')
         return 0.0, 'UNKNOWN_STATE_RESET', False
 
+    # =========================================================================
+    # Línea de referencia y seguimiento de obstáculo
+    # =========================================================================
     # ------------------------------------------------------------------
     # Reference line and obstacle track
     # ------------------------------------------------------------------
+    # Detecta periodos de avance estable y actualiza una estimación suavizada
+    # del rumbo del usuario.
     def update_stable_heading(self, now_sec: float) -> None:
         if (
             self.state == self.USER_GUIDED
@@ -1180,6 +1329,8 @@ class MaplessBypassControllerNode(Node):
         self.reference_snapshot_stamp = None
         self.initial_route_ready_since = None
 
+    # Crea la línea persistente del tramo actual a partir de la pose y el rumbo
+    # estable disponibles.
     def capture_route_line(
         self,
         now_sec: float,
@@ -1241,6 +1392,8 @@ class MaplessBypassControllerNode(Node):
         )
         return True
 
+    # Captura automáticamente la primera línea de ruta tras un tramo inicial
+    # suficientemente estable.
     def ensure_initial_route_line(
         self,
         now_sec: float,
@@ -1307,6 +1460,8 @@ class MaplessBypassControllerNode(Node):
         self.autonomous_turn_deviation = 0.0
         self.autonomous_turn_guard_active = False
 
+    # Inicia un giro manual: invalida la línea anterior y entrega prioridad total
+    # al usuario.
     def begin_manual_turn(self, now_sec: float) -> None:
         previous = self.state
         self.clear_manoeuvre_memory()
@@ -1327,6 +1482,8 @@ class MaplessBypassControllerNode(Node):
             'human has exclusive steering priority.'
         )
 
+    # Supervisa cuándo el giro manual ha terminado, solicita opcionalmente un
+    # reset de odometría y crea una nueva línea de referencia.
     def handle_manual_turn(
         self,
         now_sec: float,
@@ -1456,6 +1613,8 @@ class MaplessBypassControllerNode(Node):
             return 0.0, 'MANUAL_TURN_COMPLETE_NEW_ROUTE_LINE', False
         return 0.0, 'MANUAL_TURN_NEW_LINE_CAPTURE_FAILED', False
 
+    # Calcula avance longitudinal, error lateral y error angular respecto a la
+    # línea de referencia actual.
     def update_line_errors(self) -> None:
         if not self.line_valid:
             self.line_progress = 0.0
@@ -1470,6 +1629,8 @@ class MaplessBypassControllerNode(Node):
         self.lateral_error = -st * dx + ct * dy
         self.heading_error = wrap_angle(self.line_theta - self.yaw)
 
+    # Fija una copia del obstáculo seguido al comenzar la evasión para conservar
+    # su identidad aunque abandone el campo de visión frontal.
     def lock_current_obstacle_track(self, now_sec: float) -> None:
         fresh = self.track_stamp is not None and (now_sec - self.track_stamp) <= self.track_timeout_s
         if self.track_valid and fresh and self.track_quality >= self.tracked_obstacle_min_quality:
@@ -1507,6 +1668,8 @@ class MaplessBypassControllerNode(Node):
         )
         return correct_side and x_robot <= self.pass_entry_obstacle_x_m and abs(y_robot) >= required_lateral
 
+    # Determina geométricamente si la parte trasera del obstáculo ha quedado
+    # detrás del robot.
     def obstacle_passed_by_geometry(self) -> bool:
         relative = self.locked_obstacle_relative()
         if relative is None:
@@ -1515,9 +1678,14 @@ class MaplessBypassControllerNode(Node):
         # The rear of the obstacle, not only its centre, must be behind the robot.
         return (x_robot + radius) <= -self.pass_rear_clearance_m
 
+    # =========================================================================
+    # Inicio de evasión y evidencia lateral
+    # =========================================================================
     # ------------------------------------------------------------------
     # Start and side evidence
     # ------------------------------------------------------------------
+    # Inicializa una maniobra de evasión, selecciona lado, registra línea base de
+    # sensores laterales y bloquea el obstáculo actual.
     def start_avoidance(self, now_sec: float, keep_reference_line: bool = False) -> bool:
         previous_state = self.state
         if not keep_reference_line and not self.line_valid and not self.reactive_only_mode:
@@ -1570,6 +1738,8 @@ class MaplessBypassControllerNode(Node):
         )
         return True
 
+    # Confirma que el obstáculo ha alcanzado el lateral usando una caída
+    # persistente respecto a la línea base inicial.
     def update_side_seen(self, now_sec: float) -> None:
         """Update side-object detection and retain the complete distance profile.
 
@@ -1622,6 +1792,8 @@ class MaplessBypassControllerNode(Node):
             return 0.0
         return max(0.0, self.side_last_valid_dist - self.side_min_dist)
 
+    # Detecta el borde trasero del obstáculo mediante aumento de distancia,
+    # condición clear o una secuencia mínimo -> subida -> pérdida de eco.
     def update_side_exit_evidence(self, now_sec: float) -> None:
         """Confirm a compact obstacle rear edge from valid rise or echo dropout."""
         if not self.side_seen or self.side_exit_confirmed:
@@ -1711,9 +1883,14 @@ class MaplessBypassControllerNode(Node):
     def front_clear_confirmed(self, now_sec: float) -> bool:
         return self.front_clear_since is not None and (now_sec - self.front_clear_since) >= self.front_clear_confirm_s
 
+    # =========================================================================
+    # Generación de comandos
+    # =========================================================================
     # ------------------------------------------------------------------
     # Commands
     # ------------------------------------------------------------------
+    # Genera una apertura suave cuya magnitud crece con tiempo y progreso en vez
+    # de aplicar de forma instantánea el giro máximo.
     def compute_progressive_open_command(self, now_sec: float) -> float:
         """Open smoothly instead of immediately commanding the full steering.
 
@@ -1776,6 +1953,8 @@ class MaplessBypassControllerNode(Node):
             self.open_steer_rad,
         )
 
+    # Genera una orden aproximadamente paralela al obstáculo usando distancia
+    # lateral y error de rumbo.
     def compute_edge_follow_command(self) -> float:
         """Generate a near-parallel command while bordering the obstacle."""
         valid, distance, _clear = self.relevant_side_measurement()
@@ -1794,6 +1973,7 @@ class MaplessBypassControllerNode(Node):
         desired = self.forbid_toward_object_value(desired)
         return clamp(desired, -0.25, 0.25)
 
+    # Mantiene separación respecto al obstáculo durante la fase de paso.
     def compute_pass_command(self, now_sec: float) -> float:
         del now_sec
         valid, distance, _clear = self.relevant_side_measurement()
@@ -1830,6 +2010,8 @@ class MaplessBypassControllerNode(Node):
             and (now_sec - self.return_last_improvement_stamp) >= self.return_progress_timeout_s
         )
 
+    # Calcula un punto objetivo adelantado sobre la línea de referencia para
+    # realizar una reentrada diagonal y estable.
     def compute_return_target(self) -> tuple[float, float, float, float]:
         """Return a forward target on the frozen route line.
 
@@ -1853,6 +2035,8 @@ class MaplessBypassControllerNode(Node):
         self.return_target_lookahead = lookahead
         return target_x, target_y, self.line_theta, lookahead
 
+    # Predice el error lateral y angular futuro de un arco candidato al final
+    # de una distancia de anticipación.
     def predict_candidate_line_error(
         self,
         candidate: ArcCandidate,
@@ -1883,6 +2067,8 @@ class MaplessBypassControllerNode(Node):
         future_heading = wrap_angle(self.line_theta - future_yaw)
         return future_lateral, future_heading, future_x, future_y
 
+    # Selecciona el arco de retorno que mejor reduce el error futuro sin
+    # incrementar excesivamente la desviación lateral.
     def select_return_candidate(self, desired: float) -> float:
         options = self.valid_candidates() or self.fallback_candidates()
         if not options:
@@ -1954,6 +2140,8 @@ class MaplessBypassControllerNode(Node):
         best = min(ranked, key=lambda item: item[0])[1]
         return self.remember_safe_steer(best.steer)
 
+    # Combina Pure Pursuit y Stanley para generar la dirección deseada de retorno
+    # y después la contrasta con los arcos realmente transitables del planner.
     def compute_return_command(self) -> float:
         if not self.line_valid:
             self.return_path_blocked = True
@@ -2010,6 +2198,7 @@ class MaplessBypassControllerNode(Node):
             )
         return command
 
+    # Estrategia reactiva usada cuando la odometría no es suficientemente fiable.
     def compute_reactive_safe_command(self, now_sec: float) -> float:
         if not self.valid_candidates():
             return self.compute_emergency_escape_command()
@@ -2017,6 +2206,7 @@ class MaplessBypassControllerNode(Node):
             return self.compute_pass_command(now_sec)
         return self.least_risk_candidate(forbid_toward_object=True)
 
+    # Impone separación mínima frente al lateral donde se encuentra el obstáculo.
     def apply_side_keepaway(self, desired: float) -> float:
         valid, distance, _clear = self.relevant_side_measurement()
         if not valid or not math.isfinite(distance):
@@ -2028,6 +2218,7 @@ class MaplessBypassControllerNode(Node):
             return self.avoid_sign * max(self.pass_hold_away_steer_rad, 0.06)
         return desired
 
+    # Evita que el retorno a línea ordene un giro hacia un obstáculo lateral cercano.
     def apply_return_side_guard(self, desired: float) -> float:
         left_hard = self.side_left_valid and self.side_left_dist < self.return_side_guard_hard_m
         right_hard = self.side_right_valid and self.side_right_dist < self.return_side_guard_hard_m
@@ -2058,6 +2249,8 @@ class MaplessBypassControllerNode(Node):
             return max(desired, -limit)
         return desired
 
+    # Selecciona una dirección de escape cuando todos los arcos son inválidos.
+    # Mantiene el lado de evasión ya comprometido salvo peligro lateral inmediato.
     def compute_emergency_escape_command(self) -> float:
         """Choose the least-risk non-zero escape when every arc is invalid.
 
@@ -2164,6 +2357,9 @@ class MaplessBypassControllerNode(Node):
             clamp(steer, -self.max_steer_rad, self.max_steer_rad)
         )
 
+    # =========================================================================
+    # Selección de arcos
+    # =========================================================================
     # ------------------------------------------------------------------
     # Arc selection
     # ------------------------------------------------------------------
@@ -2186,6 +2382,8 @@ class MaplessBypassControllerNode(Node):
             and (self.now_seconds() - self.side_summary_stamp) <= self.side_summary_timeout_s
         )
 
+    # Calcula las puntuaciones globales izquierda/derecha combinando información
+    # del planner, sensores laterales y relación con la línea de referencia.
     def side_choice_scores(self) -> tuple[float, float]:
         if self.side_summary_fresh():
             left_score = float(self.side_summary[0])
@@ -2248,6 +2446,7 @@ class MaplessBypassControllerNode(Node):
         self.last_side_choice_right_score = right_score
         return left_score, right_score
 
+    # Elige el lado de evasión con mayor puntuación y aplica criterios de desempate.
     def choose_avoidance_side(self) -> int:
         left_score, right_score = self.side_choice_scores()
         if left_score <= -1e5 and right_score <= -1e5:
@@ -2274,6 +2473,8 @@ class MaplessBypassControllerNode(Node):
             - 0.24 * abs(candidate.steer) / max(self.max_steer_rad, 1e-3)
         )
 
+    # Permite cambiar una única vez de lado antes de quedar comprometido, solo si
+    # el corredor opuesto resulta claramente mejor.
     def maybe_switch_avoidance_side(self, now_sec: float, emergency: bool) -> None:
         if (
             self.state != self.AVOID_OPEN
@@ -2398,6 +2599,8 @@ class MaplessBypassControllerNode(Node):
             desired_weight=self.open_candidate_desired_weight,
         )
 
+    # Selección genérica del arco que minimiza un coste ponderado respecto al
+    # comando deseado, clearance, observación y distancia de colisión.
     def select_candidate(
         self,
         desired: float,
@@ -2431,6 +2634,7 @@ class MaplessBypassControllerNode(Node):
             return self.fallback_guidance_command(self.now_seconds())
         return self.remember_safe_steer(best.steer)
 
+    # Devuelve el arco menos arriesgado cuando no existe una solución ideal.
     def least_risk_candidate(self, forbid_toward_object: bool = False) -> float:
         options = self.valid_candidates() or self.fallback_candidates()
         if not options:
@@ -2462,6 +2666,9 @@ class MaplessBypassControllerNode(Node):
             return float(self.last_safe_steer)
         return float(self.theta_cmd)
 
+    # =========================================================================
+    # Funciones auxiliares de estado
+    # =========================================================================
     # ------------------------------------------------------------------
     # State helpers
     # ------------------------------------------------------------------
@@ -2471,6 +2678,8 @@ class MaplessBypassControllerNode(Node):
     def distance_from_avoidance_start(self) -> float:
         return math.hypot(self.x - self.avoidance_start_x, self.y - self.avoidance_start_y)
 
+    # Centraliza los cambios de estado y reinicia las variables temporales
+    # correspondientes a cada transición.
     def change_state(self, new_state: str, now_sec: float) -> None:
         if new_state != self.state:
             self.get_logger().info(f'State: {self.state} -> {new_state}')
@@ -2492,6 +2701,8 @@ class MaplessBypassControllerNode(Node):
             self.return_path_blocked = False
             self.return_recovery_active = False
 
+    # Devuelve el control al usuario al finalizar la asistencia o ante una
+    # condición que invalida la maniobra.
     def release_to_user(
         self,
         now_sec: float,
@@ -2513,6 +2724,8 @@ class MaplessBypassControllerNode(Node):
             f'route_line_preserved={preserve_route_line and self.line_valid}'
         )
 
+    # Limita desviaciones angulares excesivas durante asistencia automática y
+    # evita que el sistema derive hacia una maniobra equivalente a un giro en U.
     def apply_autonomous_turn_guard(
         self,
         target: float,
@@ -2640,15 +2853,21 @@ class MaplessBypassControllerNode(Node):
             )
         )
 
+    # Filtro de primer orden con límite de velocidad angular del servo para
+    # suavizar los cambios de dirección.
     def rate_limited_filter(self, target: float, current: float, dt: float) -> float:
         alpha = dt / max(self.steer_filter_tau_s, dt)
         filtered = current + alpha * (target - current)
         max_change = self.max_steer_rate_rad_s * dt
         return current + clamp(filtered - current, -max_change, max_change)
 
+    # =========================================================================
+    # Háptica y avisos de seguridad
+    # =========================================================================
     # ------------------------------------------------------------------
     # Haptics and warnings
     # ------------------------------------------------------------------
+    # Mantiene un patrón háptico activo durante un intervalo mínimo.
     def latch_haptic(self, pattern: int, duration_s: float) -> None:
         self.haptic_latch_pattern = int(pattern)
         self.haptic_latch_until = self.now_seconds() + duration_s
@@ -2656,6 +2875,7 @@ class MaplessBypassControllerNode(Node):
     def current_haptic(self, now_sec: float) -> int:
         return self.haptic_latch_pattern if now_sec <= self.haptic_latch_until else self.HAPTIC_NONE
 
+    # Activa un aviso de seguridad y registra su causa.
     def set_warning(self, reason: str) -> None:
         self.warning_active = True
         self.warning_reason = str(reason)
@@ -2691,9 +2911,16 @@ class MaplessBypassControllerNode(Node):
             self.get_logger().warn(f'HAPTIC_SIM: {name}')
         self.last_haptic_reported = int(pattern)
 
+    # Conversión del reloj ROS a segundos en coma flotante.
     def now_seconds(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+
+# ============================================================================
+# Punto de entrada del nodo
+# ============================================================================
+# Inicializa ROS 2, crea el controlador y mantiene activo el bucle de callbacks.
+# ============================================================================
 
 def main(args=None) -> None:
     rclpy.init(args=args)

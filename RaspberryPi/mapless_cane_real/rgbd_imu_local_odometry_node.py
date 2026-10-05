@@ -1,43 +1,46 @@
 #!/usr/bin/env python3
-"""Short-range local odometry from aligned RGB-D and an optional IMU.
+"""Odometría local de corto alcance basada en datos RGB-D alineados y una IMU.
 
-Version 10 keeps the successful v9 controller interface but improves the
-metric pose used to recover the persistent route line.  It remains local
-odometry: no Gazebo truth, global map or external absolute position is used.
+*   la traslación RGB-D puede estimarse manteniendo fija la rotación de la IMU,
+    lo que evita que pequeños errores visuales de rotación se conviertan en deriva de traslación;
+*   se compensa el brazo de palanca rígido entre la cámara y la base, de modo que
+    la rotación de una cámara montada frente a la base no se interprete erróneamente
+    como una distancia adicional recorrida;
+*   la distancia recorrida se proyecta sobre el arco plano cinemáticamente esperado
+    en lugar de utilizar la norma (siempre positiva) del movimiento ruidoso
+    hacia adelante o lateral;
+*   la escala de traslación se adapta a la curvatura: se mantiene la calibración
+    para línea recta, mientras que la escala se reduce durante giros pronunciados;
+*   los fotogramas clave (*keyframes*) se registran con menor frecuencia y solo
+    si tienen calidad suficiente, reduciendo así el número de pequeños incrementos
+    sesgados que se encadenan permanentemente;
+*   un presupuesto de deriva explícito y nuevas herramientas de diagnóstico hacen
+    visible la incertidumbre acumulada sin necesidad de retroalimentar el controlador
+    con datos de referencia de Gazebo.
 
-The main v10 corrections are:
+*   el giroscopio proporciona una referencia absoluta de guiñada (*yaw*) a corto plazo,
+    en lugar de añadir un pequeño error visual de guiñada en cada imagen;
+*   el movimiento RGB-D se estima con respecto a un fotograma clave, mejorando
+    la relación señal-ruido cuando el desplazamiento entre fotogramas es de
+    apenas unos milímetros;
+*   la traslación se proyecta sobre una trayectoria no holónoma y se integra
+    utilizando la orientación del giroscopio, evitando así grandes movimientos
+    laterales ficticios;
+*   la indicación heredada de empuje del usuario sigue siendo opcional para la
+    simulación, pero está desactivada en el bastón real, ya que la propulsión
+    y la detención dependen totalmente del usuario humano;
+*   la confianza incluye los residuos, la proporción de valores válidos (*inliers*),
+    la plausibilidad del movimiento y... Concordancia de guiñada entre RGB-D y giroscopio.
 
-* RGB-D translation can be estimated with the IMU rotation held fixed, which
-  prevents small visual rotation errors from becoming translation drift;
-* the rigid camera-to-base lever arm is compensated, so rotating a camera
-  mounted in front of the base is not mistaken for extra travelled distance;
-* travelled distance is projected onto the kinematically expected planar arc
-  instead of using the always-positive norm of noisy forward/lateral motion;
-* translation scale is curvature-adaptive: the straight calibration is kept,
-  while the scale is reduced during strong steering where v9 overestimated arc
-  length;
-* keyframes are committed less often and only with sufficient quality, reducing
-  the number of small biased increments that are permanently chained;
-* an explicit drift budget and new diagnostics make accumulated uncertainty
-  visible without feeding Gazebo truth back into the controller.
-
-Version 9 was designed for the short obstacle-avoidance manoeuvres of the
-user-pushed cane.  It is still local, drifting odometry; it does not create a
-map or perform loop closure.
-
-Main changes over v4:
-
-* the gyro provides an absolute short-term yaw reference instead of adding a
-  small visual-yaw error on every image;
-* RGB-D motion is estimated against a keyframe, improving the signal-to-noise
-  ratio when frame-to-frame displacement is only a few millimetres;
-* translation is projected onto a non-holonomic path and integrated using the
-  gyro heading, avoiding large fictitious lateral motion;
-* the legacy user-push hint remains optional for simulation, but is disabled
-  on the real cane because propulsion and stopping are entirely human;
-* confidence includes residuals, inlier ratio, motion plausibility and
-  RGB-D/gyro yaw agreement.
 """
+
+# ============================================================================
+# Importaciones
+# ============================================================================
+# Este nodo combina procesamiento de imagen, álgebra numérica y comunicaciones
+# ROS 2 para estimar la odometría local del bastón a partir de la RealSense D435
+# y de la IMU.
+# ============================================================================
 
 from __future__ import annotations
 
@@ -59,23 +62,35 @@ from std_srvs.srv import Trigger
 from .image_utils import image_to_bgr8, image_to_depth_metres
 
 
+# Limita un valor al intervalo especificado. Se utiliza de forma recurrente
+# para mantener escalas, probabilidades, velocidades y factores de mezcla dentro
+# de rangos físicamente razonables.
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+# Normaliza un ángulo al intervalo [-pi, pi], evitando discontinuidades al
+# integrar o comparar orientaciones de guiñada.
+
 def wrap_angle(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
+# Conversión de marcas temporales ROS a segundos en coma flotante.
 
 def stamp_to_seconds(stamp) -> float:
     return float(stamp.sec) + float(stamp.nanosec) * 1e-9
 
+
+# Extrae el ángulo de guiñada (yaw) de un cuaternión.
 
 def yaw_from_quaternion(q) -> float:
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
 
+# Genera un cuaternión equivalente a una rotación planar definida únicamente
+# por el ángulo yaw.
 
 def yaw_to_quaternion(yaw: float) -> Quaternion:
     q = Quaternion()
@@ -84,10 +99,31 @@ def yaw_to_quaternion(yaw: float) -> Quaternion:
     return q
 
 
+# ============================================================================
+# Nodo de odometría local RGB-D + IMU
+# ============================================================================
+# El objetivo del nodo es estimar el movimiento local del bastón sin utilizar
+# odometría de ruedas. Para ello combina:
+#
+#   - características visuales ORB extraídas de la imagen RGB;
+#   - profundidad alineada de la RealSense;
+#   - rotación de corto plazo proporcionada por la IMU;
+#   - restricciones cinemáticas del movimiento plano del bastón.
+#
+# La pose resultante se publica en /local_odom y se acompaña de una medida de
+# confianza y diversos indicadores de diagnóstico.
+# ============================================================================
+
 class RgbdImuLocalOdometryNode(Node):
     def __init__(self) -> None:
         super().__init__('rgbd_imu_local_odometry_node')
 
+        # ------------------------------------------------------------------
+        # Entradas y salidas principales
+        # ------------------------------------------------------------------
+        # Topics de imagen RGB, profundidad alineada, información intrínseca de
+        # la cámara e IMU. El motion_hint es opcional y no se utiliza por defecto
+        # en el bastón real.
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
@@ -99,6 +135,12 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('publish_debug_images', True)
         self.declare_parameter('debug_features_topic', '/debug/vo_features_image')
 
+        # ------------------------------------------------------------------
+        # Parámetros de procesamiento visual
+        # ------------------------------------------------------------------
+        # Controlan frecuencia de ejecución, sincronización RGB-D, escalado de
+        # imagen, número de características ORB, filtrado CLAHE y criterios de
+        # correspondencia entre descriptores.
         self.declare_parameter('process_rate_hz', 15.0)
         self.declare_parameter('max_sync_error_s', 0.080)
         self.declare_parameter('image_scale', 0.75)
@@ -112,6 +154,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('min_depth_m', 0.20)
         self.declare_parameter('max_depth_m', 5.50)
 
+        # ------------------------------------------------------------------
+        # Estimación métrica 3D-3D
+        # ------------------------------------------------------------------
+        # Cuando existe profundidad válida en ambos fotogramas, se reconstruyen
+        # pares de puntos 3D y se estima directamente la transformación rígida.
         # Preferred metric 3-D/3-D estimator.
         self.declare_parameter('use_rgbd_3d3d', True)
         self.declare_parameter('min_3d3d_matches', 18)
@@ -119,10 +166,20 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('rigid_inlier_threshold_m', 0.050)
         self.declare_parameter('rigid_max_rmse_m', 0.050)
 
+        # ------------------------------------------------------------------
+        # Método PnP de respaldo
+        # ------------------------------------------------------------------
+        # Si no hay suficientes pares 3D-3D, se utiliza una estimación PnP entre
+        # puntos 3D del keyframe y sus correspondencias 2D en la imagen actual.
         # PnP fallback.
         self.declare_parameter('pnp_reprojection_error_px', 3.5)
         self.declare_parameter('pnp_max_rmse_px', 3.5)
 
+        # ------------------------------------------------------------------
+        # Gestión de keyframes
+        # ------------------------------------------------------------------
+        # Los keyframes actúan como referencias temporales estables para evitar
+        # integrar continuamente desplazamientos visuales muy pequeños y ruidosos.
         # Keyframe motion accumulation.
         self.declare_parameter('keyframe_min_translation_m', 0.060)
         self.declare_parameter('keyframe_min_yaw_rad', 0.060)
@@ -131,6 +188,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('keyframe_min_inliers_for_commit', 30)
         self.declare_parameter('keyframe_force_max_age_s', 1.35)
 
+        # ------------------------------------------------------------------
+        # Escalado métrico de la traslación
+        # ------------------------------------------------------------------
+        # La escala de traslación puede adaptarse a la curvatura de la trayectoria:
+        # se permite una calibración diferente para marcha recta y para giros.
         # Metric translation. ``translation_scale`` is retained as a legacy
         # fallback when adaptive scaling is disabled.
         self.declare_parameter('translation_scale', 1.0)
@@ -142,12 +204,25 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('use_arc_projection', True)
         self.declare_parameter('arc_lateral_residual_scale_m', 0.060)
 
+        # ------------------------------------------------------------------
+        # Traslación condicionada por la rotación de la IMU
+        # ------------------------------------------------------------------
+        # Si la orientación inercial es reciente, la rotación relativa se fija
+        # mediante la IMU y el bloque RGB-D estima únicamente la traslación.
+        # Esto reduce errores de traslación inducidos por pequeñas rotaciones
+        # visuales espurias.
         # When a fresh IMU heading exists, estimate only translation from the
         # RGB-D correspondences while keeping the relative rotation fixed.
         self.declare_parameter('imu_constrained_translation', True)
         self.declare_parameter('fixed_rotation_inlier_threshold_m', 0.045)
         self.declare_parameter('fixed_rotation_max_rmse_m', 0.045)
 
+        # ------------------------------------------------------------------
+        # Geometría de montaje de la cámara
+        # ------------------------------------------------------------------
+        # Posición rígida de la RealSense respecto a base_footprint. Esta
+        # información permite compensar el movimiento aparente de la cámara
+        # debido a su separación respecto al centro de giro del bastón.
         # Camera origin expressed in base_footprint.  This translation is needed
         # to remove the apparent camera motion caused purely by base rotation.
         self.declare_parameter('camera_x_m', 0.13)
@@ -157,6 +232,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('allow_reverse', False)
         self.declare_parameter('backward_noise_tolerance_m', 0.015)
 
+        # ------------------------------------------------------------------
+        # Criterios de plausibilidad dinámica
+        # ------------------------------------------------------------------
+        # Límites utilizados para rechazar incrementos visuales incompatibles
+        # con las velocidades, aceleraciones y giros esperables del sistema.
         # Motion plausibility.
         self.declare_parameter('max_translation_per_frame_m', 0.35)
         self.declare_parameter('max_yaw_per_frame_rad', 0.40)
@@ -169,6 +249,12 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('valid_enter_confidence', 0.40)
         self.declare_parameter('valid_exit_confidence', 0.25)
 
+        # ------------------------------------------------------------------
+        # Configuración de la IMU
+        # ------------------------------------------------------------------
+        # Se admite orientación absoluta cuando está disponible. En caso
+        # contrario se integra la velocidad angular del giroscopio.
+        # También se incluye calibración automática del bias de yaw.
         # IMU and mounting.  Fused orientation is preferred when the IMU
         # publishes it; raw gyro integration remains the fallback for hardware
         # that only provides angular velocity.
@@ -188,6 +274,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('camera_pitch_down_rad', 0.0)
         self.declare_parameter('camera_yaw_offset_rad', 0.0)
 
+        # ------------------------------------------------------------------
+        # Supresión de deriva en reposo
+        # ------------------------------------------------------------------
+        # La pose solo se congela cuando coinciden evidencia visual, baja
+        # velocidad angular y, opcionalmente, ausencia prolongada de movimiento.
         # Stationary drift suppression.  The push command only indicates that a
         # user is no longer requesting movement.  Visual speed and gyro must also
         # be small before the pose is frozen, so coasting is not discarded.
@@ -198,6 +289,12 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('stationary_gyro_rad_s', 0.035)
         self.declare_parameter('stationary_keyframe_refresh_s', 0.35)
 
+        # ------------------------------------------------------------------
+        # Dead reckoning acotado ante pérdidas visuales breves
+        # ------------------------------------------------------------------
+        # Durante interrupciones muy cortas de la odometría visual se propaga la
+        # posición usando la última velocidad visual y el yaw de la IMU.
+        # La duración está expresamente limitada para evitar deriva inercial.
         # Bridge short visual drop-outs with bounded dead reckoning.  It uses
         # only the last visually measured speed and the current IMU heading; it
         # is deliberately limited to less than one second and therefore is not
@@ -207,6 +304,12 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('visual_loss_speed_decay_tau_s', 0.45)
         self.declare_parameter('visual_loss_min_speed_m_s', 0.025)
 
+        # ------------------------------------------------------------------
+        # Presupuesto explícito de deriva
+        # ------------------------------------------------------------------
+        # La incertidumbre acumulada no corrige la pose, pero se incorpora a la
+        # covarianza y a los diagnósticos para reflejar que recorridos largos son
+        # menos fiables que trayectos cortos.
         # Honest local uncertainty budget.  This does not correct the pose; it
         # grows covariance and provides diagnostics so long route segments are
         # not presented as equally certain as short ones.
@@ -217,6 +320,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.declare_parameter('frame_id', 'local_odom')
         self.declare_parameter('child_frame_id', 'base_footprint')
 
+        # ------------------------------------------------------------------
+        # Lectura y almacenamiento de parámetros
+        # ------------------------------------------------------------------
+        # Los valores declarados anteriormente se copian a atributos internos
+        # para evitar consultas repetitivas al servidor de parámetros.
         gp = lambda name: self.get_parameter(name).value
         self.color_topic = str(gp('color_topic'))
         self.depth_topic = str(gp('depth_topic'))
@@ -333,6 +441,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.frame_id = str(gp('frame_id'))
         self.child_frame_id = str(gp('child_frame_id'))
 
+        # ------------------------------------------------------------------
+        # Inicialización de herramientas de visión
+        # ------------------------------------------------------------------
+        # CLAHE mejora el contraste local; ORB extrae características y
+        # BFMatcher realiza la correspondencia binaria entre descriptores.
         self.clahe = cv2.createCLAHE(
             clipLimit=float(gp('clahe_clip_limit')),
             tileGridSize=(8, 8),
@@ -348,6 +461,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         self.rng = np.random.default_rng(42)
 
+        # ------------------------------------------------------------------
+        # Estado de las entradas RGB-D
+        # ------------------------------------------------------------------
+        # Se almacenan los últimos mensajes recibidos hasta disponer de una pareja
+        # suficientemente sincronizada para ejecutar una estimación.
         self.camera_info: Optional[CameraInfo] = None
         self.latest_color: Optional[Image] = None
         self.latest_depth: Optional[Image] = None
@@ -355,6 +473,10 @@ class RgbdImuLocalOdometryNode(Node):
         self.latest_depth_stamp = 0.0
         self.last_processed_stamp = -1.0
 
+        # ------------------------------------------------------------------
+        # Estado del keyframe actual
+        # ------------------------------------------------------------------
+        # Incluye profundidad, puntos ORB, descriptores y pose asociada.
         # Keyframe RGB-D data.  The old prev_* names are retained inside the
         # estimator, but they now refer to the current keyframe.
         self.prev_depth: Optional[np.ndarray] = None
@@ -365,6 +487,8 @@ class RgbdImuLocalOdometryNode(Node):
         self.keyframe_y = 0.0
         self.keyframe_yaw = 0.0
 
+        # Estado estimado de la odometría local: posición, orientación,
+        # velocidades, confianza y validez de la solución.
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0
@@ -379,6 +503,8 @@ class RgbdImuLocalOdometryNode(Node):
         self.last_output_yaw = 0.0
         self.last_output_stamp: Optional[float] = None
 
+        # Estado interno de la IMU: yaw integrado, referencia inicial,
+        # disponibilidad de orientación absoluta y calibración del giroscopio.
         self.imu_yaw_integrated = 0.0
         self.imu_origin_yaw = 0.0
         self.imu_origin_set = False
@@ -394,14 +520,18 @@ class RgbdImuLocalOdometryNode(Node):
         self.gyro_calibration_values: list[float] = []
         self.gyro_calibrated = not self.auto_calibrate_gyro
 
+        # Estado opcional asociado a la indicación de movimiento del usuario.
         self.motion_hint = 0.0
         self.motion_hint_stamp: Optional[float] = None
         self.zero_command_since: Optional[float] = None
 
+        # Variables utilizadas para limitar la propagación durante pérdidas
+        # visuales breves.
         self.last_visual_success_stamp: Optional[float] = None
         self.last_dead_reckon_stamp: Optional[float] = None
         self.dead_reckon_speed_m_s = 0.0
 
+        # Variables de diagnóstico y métricas de calidad de la odometría visual.
         self.last_debug_time = self.get_clock().now()
         self.debug_feature_image: Optional[np.ndarray] = None
         self.last_feature_count = 0
@@ -415,6 +545,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.distance_since_reset_m = 0.0
         self.estimated_drift_variance_m2 = 0.0
 
+        # ------------------------------------------------------------------
+        # Suscripciones ROS 2
+        # ------------------------------------------------------------------
+        # RGB, profundidad y CameraInfo son siempre necesarios. IMU y motion_hint
+        # se activan en función de los parámetros configurados.
         self.create_subscription(Image, self.color_topic, self.color_callback, qos_profile_sensor_data)
         self.create_subscription(Image, self.depth_topic, self.depth_callback, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, qos_profile_sensor_data)
@@ -423,6 +558,11 @@ class RgbdImuLocalOdometryNode(Node):
         if self.use_motion_hint:
             self.create_subscription(Float64, self.motion_hint_topic, self.motion_hint_callback, 10)
 
+        # ------------------------------------------------------------------
+        # Publicadores ROS 2
+        # ------------------------------------------------------------------
+        # Además de la odometría se publican confianza, validez y numerosas
+        # señales de diagnóstico para evaluar el comportamiento del estimador.
         self.odom_pub = self.create_publisher(Odometry, self.odom_topic, 10)
         self.valid_pub = self.create_publisher(Bool, '/local_odom_valid', 10)
         self.confidence_pub = self.create_publisher(Float64, '/local_odom_confidence', 10)
@@ -461,6 +601,8 @@ class RgbdImuLocalOdometryNode(Node):
         self.estimated_drift_pub = self.create_publisher(
             Float64, '/debug/vo_estimated_drift', 10
         )
+        # Servicio que permite redefinir el origen local de la odometría.
+        # Resulta útil tras giros manuales o cambios de segmento de trayectoria.
         self.reset_srv = self.create_service(Trigger, '/reset_local_odom', self.reset_callback)
         self.timer = self.create_timer(
             1.0 / max(self.process_rate_hz, 1.0),
@@ -473,6 +615,9 @@ class RgbdImuLocalOdometryNode(Node):
             f'keyframes=quality_gated imu_fixed_translation={self.imu_constrained_translation} motion_hint={self.use_motion_hint}'
         )
 
+    # =========================================================================
+    # Entradas de sensores
+    # =========================================================================
     # ------------------------------------------------------------------
     # Inputs
     # ------------------------------------------------------------------
@@ -487,6 +632,8 @@ class RgbdImuLocalOdometryNode(Node):
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.camera_info = msg
 
+    # Actualiza la indicación opcional de movimiento y controla cuánto tiempo
+    # lleva el sistema sin recibir una petición significativa de avance.
     def motion_hint_callback(self, msg: Float64) -> None:
         now = self.now_seconds()
         self.motion_hint = float(msg.data)
@@ -497,6 +644,12 @@ class RgbdImuLocalOdometryNode(Node):
         else:
             self.zero_command_since = None
 
+    # ------------------------------------------------------------------
+    # Procesamiento de la IMU
+    # ------------------------------------------------------------------
+    # Si existe orientación absoluta válida se utiliza como referencia de yaw.
+    # En caso contrario se integra la velocidad angular del eje Z, compensando
+    # previamente el bias estimado durante la calibración inicial.
     def imu_callback(self, msg: Imu) -> None:
         stamp = stamp_to_seconds(msg.header.stamp) or self.now_seconds()
         gyro_raw = float(msg.angular_velocity.z)
@@ -581,9 +734,20 @@ class RgbdImuLocalOdometryNode(Node):
             self.imu_origin_yaw = self.imu_yaw_integrated
             self.imu_origin_set = True
 
+    # =========================================================================
+    # Procesamiento principal RGB-D
+    # =========================================================================
     # ------------------------------------------------------------------
     # Main processing
     # ------------------------------------------------------------------
+    # Esta función constituye el ciclo principal del estimador:
+    #   1. verifica disponibilidad y sincronización de RGB y profundidad;
+    #   2. convierte y preprocesa las imágenes;
+    #   3. detecta características ORB;
+    #   4. estima el movimiento respecto al keyframe;
+    #   5. fusiona la rotación visual con la IMU;
+    #   6. aplica restricciones cinemáticas y de plausibilidad;
+    #   7. actualiza pose, confianza, covarianza y keyframe.
     def process_latest_pair(self) -> None:
         if self.camera_info is None or self.latest_color is None or self.latest_depth is None:
             self.publish_state('WAITING_FOR_RGBD_OR_CAMERA_INFO')
@@ -606,6 +770,8 @@ class RgbdImuLocalOdometryNode(Node):
             self.publish_state('IMAGE_CONVERSION_OR_ALIGNMENT_ERROR')
             return
 
+        # La imagen RGB se convierte a escala de grises y opcionalmente se
+        # mejora mediante CLAHE antes de extraer características ORB.
         gray_full = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
         if self.use_clahe:
             gray_full = self.clahe.apply(gray_full)
@@ -626,12 +792,15 @@ class RgbdImuLocalOdometryNode(Node):
                 flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS,
             )
 
+        # Si la imagen actual no contiene suficientes características fiables,
+        # no se intenta estimar una transformación visual.
         if descriptors is None or len(keypoints) < self.min_matches:
             self.propagate_during_visual_loss(pair_stamp)
             self.degrade_confidence(0.72)
             self.publish_state('TOO_FEW_CURRENT_FEATURES')
             return
 
+        # El primer par RGB-D válido se instala como keyframe inicial.
         if self.prev_descriptors is None or self.prev_keypoints is None or self.prev_depth is None:
             self.install_keyframe(
                 depth_scaled,
@@ -658,6 +827,7 @@ class RgbdImuLocalOdometryNode(Node):
                 self.current_absolute_yaw() - self.keyframe_yaw
             )
 
+        # Estimación del movimiento relativo entre el keyframe y la imagen actual.
         estimate = self.estimate_increment(
             keypoints,
             descriptors,
@@ -666,6 +836,9 @@ class RgbdImuLocalOdometryNode(Node):
             imu_delta_yaw=imu_delta_yaw,
         )
 
+        # Ante un fallo temporal del estimador visual se conserva el yaw de la
+        # IMU y, durante un intervalo breve, se permite una propagación acotada
+        # de la traslación.
         if estimate is None:
             # Keep the pose bounded during a short visual gap.  Heading comes
             # from the IMU and translation is propagated only for the configured
@@ -702,6 +875,11 @@ class RgbdImuLocalOdometryNode(Node):
         self.last_estimation_method = str(method)
         self.last_estimation_residual = float(residual)
 
+        # ------------------------------------------------------------------
+        # Fusión de yaw visual e inercial
+        # ------------------------------------------------------------------
+        # El yaw obtenido por RGB-D se corrige hacia la referencia de la IMU
+        # mediante un peso configurable, evitando integrar sesgos visuales.
         # Absolute short-term yaw reference.  Using an absolute reference avoids
         # repeatedly integrating a small fraction of visual yaw bias.
         vo_yaw_candidate = wrap_angle(self.keyframe_yaw + delta_yaw_vo)
@@ -725,6 +903,11 @@ class RgbdImuLocalOdometryNode(Node):
 
         delta_yaw_path = wrap_angle(yaw_candidate - self.keyframe_yaw)
 
+        # ------------------------------------------------------------------
+        # Proyección sobre una trayectoria plana no holónoma
+        # ------------------------------------------------------------------
+        # El movimiento estimado se proyecta sobre el eje medio del arco esperado,
+        # reduciendo desplazamientos laterales ficticios generados por ruido RGB-D.
         # For a planar non-holonomic base, the endpoint chord is aligned with
         # the mean heading of the arc.  Projecting onto that direction rejects
         # the always-positive bias introduced by hypot(df, dl) when lateral
@@ -773,6 +956,8 @@ class RgbdImuLocalOdometryNode(Node):
         raw_yaw_rate = abs(delta_yaw_path) / keyframe_age
         raw_accel = abs(raw_speed - self.last_raw_speed) / keyframe_age
 
+        # Evaluación de plausibilidad del incremento estimado según velocidad,
+        # tasa de giro y aceleración.
         plausibility = 1.0
         if raw_speed > self.max_speed_m_s:
             plausibility *= max(
@@ -812,6 +997,8 @@ class RgbdImuLocalOdometryNode(Node):
             )
             return
 
+        # Si existen evidencias suficientes de reposo, la traslación se anula
+        # para evitar deriva acumulativa mientras el bastón permanece inmóvil.
         stationary = self.stationary_evidence(pair_stamp, raw_speed)
         if stationary:
             candidate_x = self.keyframe_x
@@ -825,6 +1012,8 @@ class RgbdImuLocalOdometryNode(Node):
             candidate_x = self.keyframe_x + path_distance * math.cos(yaw_mid)
             candidate_y = self.keyframe_y + path_distance * math.sin(yaw_mid)
 
+        # La distancia finalmente aceptada se utiliza también para actualizar
+        # el presupuesto acumulado de deriva.
         accepted_step = math.hypot(
             float(candidate_x) - self.x,
             float(candidate_y) - self.y,
@@ -849,6 +1038,8 @@ class RgbdImuLocalOdometryNode(Node):
             -abs(arc_lateral_residual)
             / max(self.arc_lateral_residual_scale_m, 1e-3)
         )
+        # La confianza combina calidad geométrica, plausibilidad dinámica,
+        # coherencia del yaw y consistencia lateral respecto al arco esperado.
         confidence_raw = clamp(
             estimate_confidence
             * plausibility
@@ -870,6 +1061,8 @@ class RgbdImuLocalOdometryNode(Node):
 
         self.update_output_velocity(pair_stamp)
 
+        # Se instala un nuevo keyframe cuando el movimiento es suficiente,
+        # la calidad es adecuada o la referencia actual ha envejecido demasiado.
         motion_requests_keyframe = (
             abs(path_distance) >= self.keyframe_min_translation_m
             or abs(delta_yaw_path) >= self.keyframe_min_yaw_rad
@@ -908,9 +1101,14 @@ class RgbdImuLocalOdometryNode(Node):
             f'stationary={stationary} plausibility={plausibility:.2f}'
         )
 
+    # =========================================================================
+    # Estimación del movimiento
+    # =========================================================================
     # ------------------------------------------------------------------
     # Motion estimation
     # ------------------------------------------------------------------
+    # Realiza el emparejamiento de descriptores ORB y construye las
+    # correspondencias 3D-3D y 3D-2D necesarias para los estimadores.
     def estimate_increment(
         self,
         current_keypoints,
@@ -970,6 +1168,10 @@ class RgbdImuLocalOdometryNode(Node):
                     prev_3d.append(pp)
                     cur_3d.append(pc)
 
+        # Prioridad de estimadores:
+        #   1. 3D-3D con rotación fijada por la IMU;
+        #   2. transformación rígida 3D-3D libre;
+        #   3. PnP como método de respaldo.
         if self.use_rgbd_3d3d and len(prev_3d) >= self.min_3d3d_matches:
             previous_points = np.asarray(prev_3d, dtype=np.float64)
             current_points = np.asarray(cur_3d, dtype=np.float64)
@@ -1035,6 +1237,9 @@ class RgbdImuLocalOdometryNode(Node):
             self.last_estimation_residual = float(result[6])
         return result
 
+    # Estima únicamente la traslación suponiendo conocida la rotación relativa
+    # proporcionada por la IMU. Utiliza una mediana robusta y refinamientos por
+    # inliers para reducir el efecto de correspondencias erróneas.
     def estimate_translation_fixed_rotation(
         self,
         prev_points: np.ndarray,
@@ -1102,6 +1307,8 @@ class RgbdImuLocalOdometryNode(Node):
             rmse,
         )
 
+    # Estimación de transformación rígida 3D-3D mediante RANSAC.
+    # Se selecciona el modelo con mayor número de inliers y menor error residual.
     def estimate_rigid_ransac(
         self,
         prev_points: np.ndarray,
@@ -1160,6 +1367,8 @@ class RgbdImuLocalOdometryNode(Node):
             return None
         return rotation, translation, best_count, rmse
 
+    # Cálculo de la transformación rígida óptima entre dos nubes de puntos
+    # mediante descomposición en valores singulares (SVD).
     @staticmethod
     def rigid_svd(
         source: np.ndarray,
@@ -1185,6 +1394,8 @@ class RgbdImuLocalOdometryNode(Node):
         translation = target_centroid - rotation @ source_centroid
         return rotation, translation
 
+    # Método PnP de respaldo. Estima la pose a partir de puntos 3D del keyframe
+    # y sus posiciones correspondientes en la imagen actual.
     def estimate_pnp(
         self,
         object_points: np.ndarray,
@@ -1253,6 +1464,9 @@ class RgbdImuLocalOdometryNode(Node):
             'PNP_KEYFRAME_FALLBACK',
         )
 
+    # Convierte la transformación estimada en el sistema óptico de la cámara
+    # al sistema base_footprint. También compensa el brazo de palanca causado por
+    # la posición adelantada de la RealSense respecto al origen del robot.
     def convert_camera_transform(
         self,
         rotation_cur_prev: np.ndarray,
@@ -1334,6 +1548,8 @@ class RgbdImuLocalOdometryNode(Node):
             method,
         )
 
+    # Calcula la escala de traslación efectiva en función de la curvatura.
+    # La interpolación suave evita cambios bruscos entre calibración recta y giro.
     def effective_translation_scale(self, curvature_rad_m: float) -> float:
         """Blend straight and turning scale using a smooth curvature gate."""
         if not self.adaptive_translation_scale_enabled:
@@ -1351,9 +1567,14 @@ class RgbdImuLocalOdometryNode(Node):
             ),
         )
 
+    # =========================================================================
+    # Funciones auxiliares y publicación
+    # =========================================================================
     # ------------------------------------------------------------------
     # Helpers and publication
     # ------------------------------------------------------------------
+    # Reescala imagen, profundidad y matriz intrínseca de la cámara de forma
+    # coherente para reducir coste computacional sin alterar la geometría.
     def resize_inputs(
         self,
         gray: np.ndarray,
@@ -1382,6 +1603,8 @@ class RgbdImuLocalOdometryNode(Node):
         k[1, 2] *= scale
         return gray_scaled, depth_scaled, k
 
+    # Construye la matriz de rotación entre el frame óptico de la cámara y
+    # base_footprint, incluyendo pitch y yaw de montaje.
     def camera_to_base_rotation(self) -> np.ndarray:
         optical_to_level_base = np.array(
             [
@@ -1413,6 +1636,8 @@ class RgbdImuLocalOdometryNode(Node):
         )
         return yaw @ pitch @ optical_to_level_base
 
+    # Sustituye el keyframe actual por una nueva referencia RGB-D y almacena
+    # simultáneamente la pose local asociada.
     def install_keyframe(
         self,
         depth,
@@ -1431,6 +1656,8 @@ class RgbdImuLocalOdometryNode(Node):
         self.keyframe_y = float(pose_y)
         self.keyframe_yaw = float(pose_yaw)
 
+    # Propagación limitada durante pérdidas visuales breves. El yaw procede de
+    # la IMU y la traslación utiliza la última velocidad visual con decaimiento.
     def propagate_during_visual_loss(self, stamp: float) -> None:
         """Bounded IMU-heading dead reckoning for brief feature drop-outs.
 
@@ -1471,6 +1698,8 @@ class RgbdImuLocalOdometryNode(Node):
         self.x += distance * math.cos(self.yaw)
         self.y += distance * math.sin(self.yaw)
 
+    # Devuelve la mejor estimación disponible de yaw:
+    # orientación absoluta de IMU, integración del giroscopio o yaw actual.
     def current_absolute_yaw(self) -> float:
         if not self.use_imu:
             return self.yaw
@@ -1482,6 +1711,8 @@ class RgbdImuLocalOdometryNode(Node):
             return self.yaw
         return wrap_angle(self.imu_yaw_integrated - self.imu_origin_yaw)
 
+    # Comprueba si la información inercial disponible es suficientemente reciente
+    # respecto al instante de la pareja RGB-D procesada.
     def imu_is_fresh(self, reference_stamp: float) -> bool:
         if not self.use_imu:
             return False
@@ -1497,6 +1728,8 @@ class RgbdImuLocalOdometryNode(Node):
         )
         return orientation_fresh or gyro_fresh
 
+    # Determina si existe evidencia suficiente de reposo combinando, cuando está
+    # habilitado, motion_hint, velocidad visual y velocidad angular de la IMU.
     def stationary_evidence(self, now: float, visual_speed: float) -> bool:
         if not self.use_motion_hint:
             return False
@@ -1511,6 +1744,8 @@ class RgbdImuLocalOdometryNode(Node):
             and abs(self.last_gyro_z) <= self.stationary_gyro_rad_s
         )
 
+    # Calcula y filtra las velocidades lineal y angular a partir de la evolución
+    # temporal de la pose estimada.
     def update_output_velocity(self, stamp: float) -> None:
         if self.last_output_stamp is None:
             self.last_output_stamp = stamp
@@ -1544,6 +1779,8 @@ class RgbdImuLocalOdometryNode(Node):
         self.last_output_y = self.y
         self.last_output_yaw = self.yaw
 
+    # Actualiza la validez de la odometría mediante histéresis sobre la confianza,
+    # evitando oscilaciones rápidas entre estados válido/no válido.
     def update_valid_state(self) -> None:
         enter = max(self.valid_enter_confidence, self.valid_exit_confidence)
         exit_ = min(self.valid_enter_confidence, self.valid_exit_confidence)
@@ -1552,10 +1789,14 @@ class RgbdImuLocalOdometryNode(Node):
         else:
             self.valid = self.confidence >= enter
 
+    # Reduce la confianza cuando existe un fallo temporal de percepción o una
+    # estimación insuficientemente fiable.
     def degrade_confidence(self, factor: float) -> None:
         self.confidence *= factor
         self.update_valid_state()
 
+    # Servicio de reinicio de la odometría local. Restablece origen, velocidades,
+    # keyframe, métricas de deriva y referencias inerciales relativas.
     def reset_callback(self, request, response):
         del request
         self.x = 0.0
@@ -1608,6 +1849,8 @@ class RgbdImuLocalOdometryNode(Node):
         )
         return response
 
+    # Publica la pose, velocidades, covarianzas, confianza, validez y métricas
+    # de diagnóstico asociadas al estado actual del estimador.
     def publish_state(self, reason: str) -> None:
         odom = Odometry()
         odom.header.stamp = self.get_clock().now().to_msg()
@@ -1680,6 +1923,8 @@ class RgbdImuLocalOdometryNode(Node):
             self.get_logger().info(debug)
             self.last_debug_time = now
 
+    # Genera una imagen de depuración con las características ORB y un resumen
+    # textual del estado de la odometría visual.
     def publish_feature_debug(self, reason: str) -> None:
         if not self.publish_debug_images or self.debug_feature_image is None:
             return
@@ -1719,9 +1964,18 @@ class RgbdImuLocalOdometryNode(Node):
         msg.data = image.tobytes()
         self.feature_debug_pub.publish(msg)
 
+    # Conversión del reloj ROS a segundos en coma flotante.
     def now_seconds(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+
+# ============================================================================
+# Punto de entrada del nodo
+# ============================================================================
+# Inicializa ROS 2, crea el estimador de odometría y mantiene el nodo activo.
+# El cierre contempla además un RuntimeError específico observado en ROS 2 Jazzy
+# durante la destrucción de algunas suscripciones tras SIGINT.
+# ============================================================================
 
 def main(args=None) -> None:
     rclpy.init(args=args)

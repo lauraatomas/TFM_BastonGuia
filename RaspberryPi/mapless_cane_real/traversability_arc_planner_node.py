@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
-"""Generate collision-checked steering arcs from RGB-D plus short-lived memory.
+"""Genera arcos de dirección con comprobación de colisiones a partir de RGB-D
+y una memoria local de obstáculos de corta duración.
 
-Real-hardware revision: floor-band rejection prevents depth noise around z=0
-from being classified simultaneously as ground and obstacle.
+Revisión para hardware real: el rechazo de una banda alrededor del suelo evita
+que el ruido de profundidad próximo a z=0 se clasifique simultáneamente como
+suelo y como obstáculo.
 
-This is not a global map.  Obstacle cells are retained only for a few seconds in
-/local_odom so that a cone or bollard does not disappear the instant it leaves
-the frontal camera field of view.  The memory is pruned continuously and is
-cleared when local odometry is unreliable.
+Este nodo no construye un mapa global. Las celdas correspondientes a obstáculos
+se conservan únicamente durante unos segundos en el sistema de referencia
+/local_odom, de forma que un cono, bolardo u otro obstáculo no desaparezca de la
+representación inmediatamente después de abandonar el campo de visión frontal
+de la cámara. Esta memoria se depura continuamente y se elimina cuando la
+odometría local deja de ser fiable.
 
-Candidate array format, repeated every eight values:
+Formato del array de candidatos, repetido cada ocho valores:
     [steer_rad, valid, minimum_clearance_m, observed_ratio,
      collision_distance_m, score, far_clearance_m, tail_clearance_m]
 
-Tracked obstacle format on /tracked_front_obstacle:
+Formato del obstáculo seguido en /tracked_front_obstacle:
     [valid, x_in_local_odom, y_in_local_odom, radius_m, quality]
 """
+
+# ============================================================================
+# Importaciones
+# ============================================================================
+# El planificador combina procesamiento de profundidad, operaciones morfológicas,
+# cálculo numérico y comunicaciones ROS 2 para evaluar trayectorias locales.
+# ============================================================================
 
 from __future__ import annotations
 
@@ -36,9 +47,14 @@ from std_msgs.msg import Bool, Float32MultiArray, Float64, String
 from .image_utils import image_to_depth_metres
 
 
+# Limita un valor al intervalo indicado para mantener parámetros y resultados
+# de planificación dentro de rangos válidos.
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
+
+# Extrae el ángulo de guiñada (yaw) de la orientación de la odometría local.
 
 def yaw_from_quaternion(q) -> float:
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -46,18 +62,34 @@ def yaw_from_quaternion(q) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+# ============================================================================
+# Nodo de planificación local por arcos
+# ============================================================================
+# Este nodo transforma la profundidad RGB-D en una representación local de
+# obstáculos y evalúa múltiples trayectorias curvas posibles para el bastón.
+#
+# Su función es local y reactiva: determinar qué direcciones son transitables,
+# cuánto espacio libre existe y a qué distancia aparecería una colisión.
+# ============================================================================
+
 class TraversabilityArcPlannerNode(Node):
     CANDIDATE_WIDTH = 8
 
     def __init__(self) -> None:
         super().__init__('traversability_arc_planner_node')
 
+        # Entradas principales: profundidad alineada, parámetros intrínsecos de
+        # cámara y odometría local utilizada por la memoria temporal de obstáculos.
         self.declare_parameter('depth_topic', '/camera/camera/aligned_depth_to_color/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/camera/color/camera_info')
         self.declare_parameter('odom_topic', '/local_odom')
         self.declare_parameter('process_rate_hz', 8.0)
         self.declare_parameter('depth_timeout_s', 1.0)
 
+        # ------------------------------------------------------------------
+        # Geometría de montaje de la cámara
+        # ------------------------------------------------------------------
+        # Posición y orientación de la RealSense respecto a base_footprint.
         # Camera mount in base_footprint. Positive pitch looks downward.
         self.declare_parameter('camera_height_m', 0.58)
         self.declare_parameter('camera_x_m', 0.18)
@@ -65,6 +97,11 @@ class TraversabilityArcPlannerNode(Node):
         self.declare_parameter('camera_pitch_down_rad', 0.18)
         self.declare_parameter('camera_yaw_offset_rad', 0.0)
 
+        # ------------------------------------------------------------------
+        # Profundidad y rejilla local
+        # ------------------------------------------------------------------
+        # Define el muestreo de la imagen, el rango útil de profundidad y los
+        # criterios verticales para distinguir suelo, observación y obstáculos.
         # Depth and local grid.
         self.declare_parameter('depth_stride', 4)
         self.declare_parameter('min_depth_m', 0.20)
@@ -80,6 +117,11 @@ class TraversabilityArcPlannerNode(Node):
         self.declare_parameter('observation_dilation_cells', 3)
         self.declare_parameter('obstacle_dilation_cells', 1)
 
+        # ------------------------------------------------------------------
+        # Modelo cinemático y muestreo de arcos
+        # ------------------------------------------------------------------
+        # Cada ángulo de dirección genera una curvatura distinta siguiendo una
+        # aproximación de modelo bicicleta.
         # Robot model and arc sampling.
         self.declare_parameter('wheelbase_m', 0.55)
         self.declare_parameter('robot_width_m', 0.48)
@@ -97,12 +139,21 @@ class TraversabilityArcPlannerNode(Node):
         self.declare_parameter('speed_filter_window', 7)
         self.declare_parameter('max_planning_speed_m_s', 0.80)
 
+        # ------------------------------------------------------------------
+        # Espacio desconocido y soporte de suelo
+        # ------------------------------------------------------------------
+        # Un arco puede invalidarse si atraviesa zonas insuficientemente observadas.
         # Unknown-space and ground support.
         self.declare_parameter('min_observed_ratio', 0.36)
         self.declare_parameter('near_observed_distance_m', 1.0)
         self.declare_parameter('enable_ground_support_check', False)
         self.declare_parameter('min_ground_support_ratio', 0.30)
 
+        # ------------------------------------------------------------------
+        # Memoria local de obstáculos
+        # ------------------------------------------------------------------
+        # Conserva durante pocos segundos los obstáculos en /local_odom para evitar
+        # que desaparezcan en cuanto salen del campo de visión frontal.
         # Short-lived obstacle memory. This is a few-second local cache, not SLAM.
         self.declare_parameter('enable_obstacle_memory', True)
         self.declare_parameter('obstacle_memory_time_s', 4.0)
@@ -110,6 +161,10 @@ class TraversabilityArcPlannerNode(Node):
         self.declare_parameter('obstacle_memory_max_cells', 5000)
         self.declare_parameter('memory_min_odom_confidence', 0.25)
 
+        # ------------------------------------------------------------------
+        # Seguimiento del obstáculo frontal
+        # ------------------------------------------------------------------
+        # Identifica el obstáculo actual más próximo que invade el corredor del robot.
         # Nearest blocking obstacle track.
         self.declare_parameter('track_corridor_extra_m', 0.22)
         self.declare_parameter('track_search_extra_m', 0.45)
@@ -117,6 +172,11 @@ class TraversabilityArcPlannerNode(Node):
         self.declare_parameter('track_min_radius_m', 0.08)
         self.declare_parameter('track_max_radius_m', 0.55)
 
+        # ------------------------------------------------------------------
+        # Puntuación de candidatos
+        # ------------------------------------------------------------------
+        # Cada arco se valora según clearance, cobertura observada y penalización
+        # por magnitud de giro.
         # Scores.
         self.declare_parameter('clearance_score_weight', 1.0)
         self.declare_parameter('observed_score_weight', 0.55)
@@ -129,6 +189,7 @@ class TraversabilityArcPlannerNode(Node):
         self.declare_parameter('publish_debug_grid', True)
         self.declare_parameter('debug_grid_scale', 5)
 
+        # Lectura y almacenamiento de parámetros ROS en atributos internos.
         gp = lambda name: self.get_parameter(name).value
         self.depth_topic = str(gp('depth_topic'))
         self.camera_info_topic = str(gp('camera_info_topic'))
@@ -200,11 +261,13 @@ class TraversabilityArcPlannerNode(Node):
         self.publish_debug_grid_enabled = bool(gp('publish_debug_grid'))
         self.debug_grid_scale = max(2, int(gp('debug_grid_scale')))
 
+        # Estado de las entradas más recientes de cámara y profundidad.
         self.camera_info: Optional[CameraInfo] = None
         self.latest_depth: Optional[Image] = None
         self.latest_depth_stamp = 0.0
         self.last_processed_stamp = -1.0
 
+        # Estado de la odometría local y estimación filtrada de velocidad.
         self.odom_x = 0.0
         self.odom_y = 0.0
         self.odom_yaw = 0.0
@@ -214,10 +277,13 @@ class TraversabilityArcPlannerNode(Node):
         self.speed_samples: deque[float] = deque(maxlen=self.speed_filter_window)
         self.speed_mps = 0.0
 
+        # Diccionario de memoria: cada celda en /local_odom almacena el instante
+        # en el que fue observada por última vez.
         # Local-odom voxel cell -> last seen time.
         self.obstacle_memory: dict[tuple[int, int], float] = {}
         self.last_debug_time = self.get_clock().now()
 
+        # Suscripciones a cámara, profundidad, odometría y estado de confianza.
         self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, qos_profile_sensor_data)
         self.create_subscription(Image, self.depth_topic, self.depth_callback, qos_profile_sensor_data)
         self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 10)
@@ -225,6 +291,8 @@ class TraversabilityArcPlannerNode(Node):
         self.create_subscription(Float64, '/local_odom_confidence', self.odom_confidence_callback, 10)
         self.create_subscription(Bool, '/planner/clear_obstacle_memory', self.clear_memory_callback, 10)
 
+        # Publicadores de arcos candidatos, distancia de colisión, mejor dirección,
+        # emergencia, resumen lateral, obstáculo seguido y depuración visual.
         self.candidates_pub = self.create_publisher(Float32MultiArray, '/local_arc_candidates', 10)
         self.front_collision_pub = self.create_publisher(Float64, '/front_collision_distance', 10)
         self.trigger_pub = self.create_publisher(Float64, '/avoidance_trigger_distance', 10)
@@ -243,9 +311,12 @@ class TraversabilityArcPlannerNode(Node):
             f'candidates={self.num_steering_candidates} memory={self.enable_obstacle_memory}'
         )
 
+    # Guarda los parámetros intrínsecos de la cámara necesarios para reconstruir
+    # puntos 3D a partir de la imagen de profundidad.
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.camera_info = msg
 
+    # Actualiza la pose local y filtra la velocidad con una mediana temporal.
     def odom_callback(self, msg: Odometry) -> None:
         self.odom_x = float(msg.pose.pose.position.x)
         self.odom_y = float(msg.pose.pose.position.y)
@@ -255,16 +326,19 @@ class TraversabilityArcPlannerNode(Node):
         self.speed_samples.append(min(speed, self.max_planning_speed_m_s))
         self.speed_mps = float(np.median(np.asarray(self.speed_samples, dtype=np.float32)))
 
+    # Si la odometría deja de ser válida, la memoria de obstáculos se elimina.
     def odom_valid_callback(self, msg: Bool) -> None:
         self.odom_valid = bool(msg.data)
         if not self.odom_valid:
             self.obstacle_memory.clear()
 
+    # También se borra la memoria si la confianza cae por debajo del mínimo.
     def odom_confidence_callback(self, msg: Float64) -> None:
         self.odom_confidence = float(msg.data)
         if self.odom_confidence < self.memory_min_odom_confidence:
             self.obstacle_memory.clear()
 
+    # Permite que el controlador solicite un borrado explícito de la memoria.
     def clear_memory_callback(self, msg: Bool) -> None:
         if not bool(msg.data):
             return
@@ -274,11 +348,17 @@ class TraversabilityArcPlannerNode(Node):
             f'Obstacle memory cleared on controller request ({count} cells).'
         )
 
+    # Almacena la última imagen de profundidad y su marca temporal.
     def depth_callback(self, msg: Image) -> None:
         self.latest_depth = msg
         stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
         self.latest_depth_stamp = stamp if stamp > 0.0 else self.now_seconds()
 
+    # =========================================================================
+    # Ciclo principal de planificación
+    # =========================================================================
+    # Valida la profundidad, reconstruye puntos 3D, genera máscaras locales,
+    # actualiza memoria, evalúa arcos y publica la mejor opción disponible.
     def process_latest_depth(self) -> None:
         if self.camera_info is None or self.latest_depth is None:
             return
@@ -299,13 +379,16 @@ class TraversabilityArcPlannerNode(Node):
             self.publish_empty('TOO_FEW_VALID_DEPTH_POINTS')
             return
 
+        # Construcción de las máscaras de obstáculo, zona observada y suelo.
         current_obstacle, observed, ground = self.build_current_masks(points_base)
 
+        # El horizonte aumenta con la velocidad para anticipar obstáculos.
         horizon = clamp(
             self.min_horizon_m + self.speed_mps * self.lookahead_time_s,
             self.min_horizon_m,
             self.max_horizon_m,
         )
+        # La distancia de activación de evasión también crece con la velocidad.
         trigger_distance = clamp(
             self.base_trigger_distance_m + self.speed_mps * self.reaction_time_s,
             self.base_trigger_distance_m,
@@ -325,7 +408,9 @@ class TraversabilityArcPlannerNode(Node):
         else:
             obstacle = current_obstacle
 
+        # Mapa de distancia al obstáculo más cercano para cada celda libre.
         clearance_grid = self.compute_clearance_grid(obstacle)
+        # Conjunto uniforme de ángulos de dirección entre derecha e izquierda.
         steer_values = np.linspace(
             -self.max_steer_rad,
             self.max_steer_rad,
@@ -341,6 +426,8 @@ class TraversabilityArcPlannerNode(Node):
         straight_index = int(np.argmin(np.abs(steer_values)))
         straight = candidates[straight_index]
         front_collision_distance = float(straight[4])
+        # Se selecciona el arco válido con mayor puntuación. Si ninguno es válido,
+        # se conserva igualmente el menos desfavorable para gestión de emergencia.
         valid_candidates = [candidate for candidate in candidates if candidate[1] > 0.5]
         if valid_candidates:
             best = max(valid_candidates, key=lambda candidate: candidate[5])
@@ -387,6 +474,7 @@ class TraversabilityArcPlannerNode(Node):
             self.get_logger().info(debug)
             self.last_debug_time = now_clock
 
+    # Genera una vista cenital de la rejilla y de los arcos evaluados.
     def publish_debug_grid(
         self,
         obstacle: np.ndarray,
@@ -401,6 +489,8 @@ class TraversabilityArcPlannerNode(Node):
         canvas[observed > 0] = (65, 95, 65)      # observed free / support
         canvas[obstacle > 0] = (25, 25, 230)     # obstacle (BGR)
 
+        # Clearance mínimo exigido: mitad del ancho, margen de seguridad y término
+        # adicional dependiente de la velocidad.
         required_clearance = (
             0.5 * self.robot_width_m
             + self.safety_margin_m
@@ -462,9 +552,14 @@ class TraversabilityArcPlannerNode(Node):
         msg.data = view.tobytes()
         self.debug_grid_pub.publish(msg)
 
+    # =========================================================================
+    # Reconstrucción 3D y generación de máscaras
+    # =========================================================================
     # ------------------------------------------------------------------
     # Point cloud and masks
     # ------------------------------------------------------------------
+    # Reconstruye puntos 3D métricos usando los parámetros intrínsecos y los
+    # transforma desde el frame óptico de la cámara a base_footprint.
     def depth_to_base_points(self, depth_m: np.ndarray) -> Optional[np.ndarray]:
         info = self.camera_info
         if info is None:
@@ -488,6 +583,7 @@ class TraversabilityArcPlannerNode(Node):
         base_points[2, :] += self.camera_height_m
         return base_points.T
 
+    # Matriz de rotación del frame óptico de la cámara al frame base.
     def camera_to_base_rotation(self) -> np.ndarray:
         optical_to_level_base = np.array(
             [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
@@ -501,11 +597,14 @@ class TraversabilityArcPlannerNode(Node):
         yaw = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
         return yaw @ pitch @ optical_to_level_base
 
+    # Calcula las dimensiones de la rejilla local a partir de resolución y alcance.
     def grid_shape(self) -> tuple[int, int]:
         nx = int(math.ceil(self.grid_x_max_m / self.grid_resolution_m)) + 1
         ny = int(math.ceil((2.0 * self.grid_y_half_m) / self.grid_resolution_m)) + 1
         return nx, ny
 
+    # Clasifica puntos 3D como obstáculo, zona observada o suelo y aplica
+    # dilataciones morfológicas para obtener regiones más continuas.
     def build_current_masks(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         nx, ny = self.grid_shape()
         obstacle = np.zeros((nx, ny), dtype=np.uint8)
@@ -552,14 +651,19 @@ class TraversabilityArcPlannerNode(Node):
             obstacle = cv2.dilate(obstacle, np.ones((k, k), dtype=np.uint8), iterations=1)
         return obstacle, observed, ground
 
+    # Calcula la distancia euclídea de cada celda libre al obstáculo más cercano.
     def compute_clearance_grid(self, obstacle: np.ndarray) -> np.ndarray:
         free_image = ((1 - obstacle) * 255).astype(np.uint8)
         distance_cells = cv2.distanceTransform(free_image, cv2.DIST_L2, 5)
         return distance_cells.astype(np.float32) * self.grid_resolution_m
 
+    # =========================================================================
+    # Memoria local y seguimiento de obstáculos
+    # =========================================================================
     # ------------------------------------------------------------------
     # Short-lived memory and track
     # ------------------------------------------------------------------
+    # La memoria solo se utiliza si la odometría local es válida y fiable.
     def memory_usable(self) -> bool:
         return (
             self.have_odom
@@ -567,6 +671,8 @@ class TraversabilityArcPlannerNode(Node):
             and self.odom_confidence >= self.memory_min_odom_confidence
         )
 
+    # Transforma los obstáculos actuales a /local_odom y actualiza su instante
+    # de última observación.
     def update_obstacle_memory(self, points_base: np.ndarray, now: float) -> None:
         if not self.memory_usable():
             self.obstacle_memory.clear()
@@ -596,12 +702,15 @@ class TraversabilityArcPlannerNode(Node):
             for key, _stamp in oldest[: len(self.obstacle_memory) - self.obstacle_memory_max_cells]:
                 self.obstacle_memory.pop(key, None)
 
+    # Elimina celdas de memoria que han superado su tiempo de vida.
     def prune_obstacle_memory(self, now: float) -> None:
         cutoff = now - self.obstacle_memory_time_s
         stale = [key for key, stamp in self.obstacle_memory.items() if stamp < cutoff]
         for key in stale:
             self.obstacle_memory.pop(key, None)
 
+    # Reproyecta las celdas memorizadas al frame actual e incorpora esos obstáculos
+    # a la máscara utilizada para planificar.
     def inject_obstacle_memory(self, obstacle: np.ndarray) -> None:
         if not self.memory_usable() or not self.obstacle_memory:
             return
@@ -626,6 +735,7 @@ class TraversabilityArcPlannerNode(Node):
         iy = np.clip(iy, 0, obstacle.shape[1] - 1)
         obstacle[ix, iy] = 1
 
+    # Busca el componente conectado más cercano que intersecta el corredor frontal.
     def find_front_obstacle_track(
         self, obstacle: np.ndarray, trigger_distance: float
     ) -> Optional[tuple[float, float, float, float]]:
@@ -665,6 +775,7 @@ class TraversabilityArcPlannerNode(Node):
                 best_min_x = min_x
         return best
 
+    # Publica el obstáculo seguido en coordenadas de /local_odom.
     def publish_track(self, track: Optional[tuple[float, float, float, float]]) -> None:
         if track is None or not self.memory_usable():
             self.track_pub.publish(Float32MultiArray(data=[0.0, 0.0, 0.0, 0.0, 0.0]))
@@ -677,9 +788,14 @@ class TraversabilityArcPlannerNode(Node):
             Float32MultiArray(data=[1.0, float(x_local), float(y_local), float(radius), float(quality)])
         )
 
+    # =========================================================================
+    # Evaluación geométrica de arcos
+    # =========================================================================
     # ------------------------------------------------------------------
     # Arc evaluation
     # ------------------------------------------------------------------
+    # Evalúa una trayectoria curva concreta comprobando clearance, colisión,
+    # cobertura observada, espacio libre lejano y soporte de suelo opcional.
     def evaluate_arc(
         self,
         steer: float,
@@ -694,6 +810,7 @@ class TraversabilityArcPlannerNode(Node):
             self.arc_sample_step_m,
             dtype=np.float64,
         )
+        # Modelo bicicleta: curvatura = tan(steer) / wheelbase.
         curvature = math.tan(steer) / max(self.wheelbase_m, 1e-3)
         if abs(curvature) < 1e-5:
             x = sample_s
@@ -744,9 +861,12 @@ class TraversabilityArcPlannerNode(Node):
             if clearance.size else 0.0
         )
 
+        # Un arco es válido si no presenta colisión y está suficientemente observado.
         valid = collision_indices.size == 0 and near_observed_ratio >= self.min_observed_ratio
         if self.enable_ground_support_check:
             valid = valid and ground_ratio >= self.min_ground_support_ratio
+        # La puntuación favorece mayor espacio libre y cobertura observada y
+        # penaliza giros excesivos.
         score = (
             0.58 * self.clearance_score_weight * min(min_clearance, 1.5)
             + 0.27 * self.clearance_score_weight * min(far_clearance, 1.5)
@@ -767,6 +887,8 @@ class TraversabilityArcPlannerNode(Node):
             tail_clearance,
         )
 
+    # Resume la calidad global de los corredores izquierdo y derecho usando
+    # varios de los mejores arcos de cada lado.
     def compute_side_summary(
         self,
         candidates: list[Tuple[float, float, float, float, float, float, float, float]],
@@ -818,6 +940,8 @@ class TraversabilityArcPlannerNode(Node):
             left[3], right[3], left[4], right[4],
         )
 
+    # Estado seguro ante falta de información: no declara arcos válidos y marca
+    # explícitamente la condición de emergencia.
     def publish_empty(self, reason: str) -> None:
         self.candidates_pub.publish(Float32MultiArray(data=[]))
         self.front_collision_pub.publish(Float64(data=0.0))
@@ -829,9 +953,16 @@ class TraversabilityArcPlannerNode(Node):
         self.side_summary_pub.publish(Float32MultiArray(data=[-1e6, -1e6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
         self.debug_pub.publish(String(data=reason))
 
+    # Conversión del reloj ROS a segundos en coma flotante.
     def now_seconds(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+
+# ============================================================================
+# Punto de entrada del nodo
+# ============================================================================
+# Inicializa ROS 2, crea el planificador y mantiene el nodo activo.
+# ============================================================================
 
 def main(args=None) -> None:
     rclpy.init(args=args)

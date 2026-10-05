@@ -23,6 +23,13 @@ La detección de si el bastón se está desplazando se obtiene exclusivamente de
 /local_odom. Ya no existe /hardware/user_push_hint en este nodo.
 """
 
+# ============================================================================
+# Importaciones
+# ============================================================================
+# Este nodo combina lógica de arbitraje de dirección, estimación de movimiento
+# a partir de odometría y publicación de la orden final de servo.
+# ============================================================================
+
 from __future__ import annotations
 
 import math
@@ -35,13 +42,19 @@ from rclpy.node import Node
 from std_msgs.msg import Bool, Float64, String
 
 
+# Limita un valor al intervalo indicado.
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+# Normaliza un ángulo al intervalo [-pi, pi].
+
 def wrap_angle(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
+
+# Extrae el ángulo de guiñada (yaw) de un cuaternión de orientación ROS.
 
 def yaw_from_quaternion(q) -> float:
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
@@ -49,11 +62,22 @@ def yaw_from_quaternion(q) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+# Desplaza progresivamente un valor hacia un objetivo sin superar el incremento
+# máximo permitido. Se utiliza para suavizar la orden del servo.
+
 def move_towards(current: float, target: float, max_delta: float) -> float:
     if target > current:
         return min(target, current + max_delta)
     return max(target, current - max_delta)
 
+
+# ============================================================================
+# Multiplexor de dirección
+# ============================================================================
+# Este nodo decide qué fuente tiene autoridad sobre la rueda delantera en cada
+# instante. No genera propulsión ni frenado: únicamente determina el ángulo final
+# de dirección que se enviará al ESP32.
+# ============================================================================
 
 class SteeringCommandMuxNode(Node):
     USER_GUIDED = 'USER_GUIDED'
@@ -66,6 +90,12 @@ class SteeringCommandMuxNode(Node):
     def __init__(self) -> None:
         super().__init__('steering_command_mux_node')
 
+        # ------------------------------------------------------------------
+        # Interfaces ROS
+        # ------------------------------------------------------------------
+        # Todos los topics de este nodo están relacionados con dirección,
+        # asistencia o localización. El movimiento longitudinal sigue dependiendo
+        # exclusivamente del usuario.
         # Topics: todos son de DIRECCIÓN/localización.
         self.declare_parameter(
             'human_steer_topic',
@@ -101,6 +131,11 @@ class SteeringCommandMuxNode(Node):
             '/steering_pos_cmd',
         )
 
+        # ------------------------------------------------------------------
+        # Temporización y límites de dirección
+        # ------------------------------------------------------------------
+        # Define frecuencia de control, timeouts de entrada, límite angular,
+        # inversión de signo y offset mecánico del servo.
         # Temporización y límites.
         self.declare_parameter('control_rate_hz', 40.0)
         self.declare_parameter('input_timeout_s', 0.60)
@@ -109,6 +144,11 @@ class SteeringCommandMuxNode(Node):
         self.declare_parameter('steer_sign', 1.0)
         self.declare_parameter('steer_offset_rad', 0.0)
 
+        # ------------------------------------------------------------------
+        # Entrada manual del usuario
+        # ------------------------------------------------------------------
+        # Determina cuándo una orden humana se considera suficientemente grande
+        # como para tomar prioridad sobre cualquier asistencia automática.
         # Entrada humana.
         self.declare_parameter(
             'manual_enter_deadband_rad',
@@ -119,6 +159,11 @@ class SteeringCommandMuxNode(Node):
             1.80,
         )
 
+        # ------------------------------------------------------------------
+        # Recentrado tras un giro manual
+        # ------------------------------------------------------------------
+        # Al soltar el botón o flecha se reduce progresivamente la dirección y se
+        # usa la velocidad angular de la odometría para amortiguar el giro residual.
         # Centrado posterior al giro humano.
         self.declare_parameter(
             'settle_slew_rate_rad_s',
@@ -153,6 +198,11 @@ class SteeringCommandMuxNode(Node):
             2.50,
         )
 
+        # ------------------------------------------------------------------
+        # Mantenimiento de rumbo
+        # ------------------------------------------------------------------
+        # Una vez finalizado el giro manual, el nuevo yaw se memoriza como referencia
+        # y se corrigen pequeñas desviaciones mientras el bastón sigue avanzando.
         # Mantenimiento del rumbo elegido por la persona.
         self.declare_parameter('heading_kp', 0.55)
         self.declare_parameter('heading_kd', 0.18)
@@ -185,6 +235,11 @@ class SteeringCommandMuxNode(Node):
             0.50,
         )
 
+        # ------------------------------------------------------------------
+        # Detección de movimiento
+        # ------------------------------------------------------------------
+        # El estado MOVING/STOPPED se deduce exclusivamente de /local_odom.
+        # Se utiliza histéresis para evitar cambios de estado por ruido cerca de cero.
         # Movimiento físico inferido de /local_odom.
         # Histeresis para que no cambie MOVING/STOPPED por ruido cerca de 0.
         self.declare_parameter(
@@ -196,6 +251,11 @@ class SteeringCommandMuxNode(Node):
             0.025,
         )
 
+        # ------------------------------------------------------------------
+        # Criterios de validez de la orientación
+        # ------------------------------------------------------------------
+        # Permiten exigir una odometría reciente, válida y con confianza mínima
+        # antes de utilizar el yaw para mantener rumbo.
         # Calidad de orientación.
         self.declare_parameter(
             'require_odom_valid_for_heading',
@@ -210,6 +270,7 @@ class SteeringCommandMuxNode(Node):
             3.0,
         )
 
+        # Lectura y almacenamiento de parámetros ROS.
         gp = lambda name: self.get_parameter(name).value
 
         self.human_steer_topic = str(gp('human_steer_topic'))
@@ -312,12 +373,15 @@ class SteeringCommandMuxNode(Node):
             gp('heading_reference_max_stale_s')
         )
 
+        # Estado de las entradas manuales y automáticas de dirección.
         # Entradas de dirección.
         self.human_steer = 0.0
         self.manual_turn_active = False
         self.assist_steer = 0.0
         self.assist_active = False
 
+        # /stop_requested se conserva únicamente como información diagnóstica.
+        # Este nodo nunca convierte ese aviso en una orden de frenado.
         # /stop_requested se conserva SOLO como aviso/diagnóstico.
         self.stop_requested = False
 
@@ -325,6 +389,7 @@ class SteeringCommandMuxNode(Node):
         self.assist_stamp: Optional[float] = None
         self.manual_stamp: Optional[float] = None
 
+        # Estado de odometría utilizado para yaw, velocidad y detección de movimiento.
         # Odometría.
         self.have_odom = False
         self.odom_valid = False
@@ -335,6 +400,7 @@ class SteeringCommandMuxNode(Node):
         self.speed = 0.0
         self.moving = False
 
+        # Estado interno de la máquina de arbitraje y referencia de rumbo.
         # Estado interno.
         self.state = self.USER_GUIDED
         self.state_started_at = self.now_seconds()
@@ -349,6 +415,11 @@ class SteeringCommandMuxNode(Node):
         self.last_control_time = self.get_clock().now()
         self.last_debug_time = self.get_clock().now()
 
+        # ------------------------------------------------------------------
+        # Suscripciones ROS 2
+        # ------------------------------------------------------------------
+        # Reciben intención humana, asistencia automática, odometría y señales
+        # auxiliares de estado.
         # Suscripciones.
         self.create_subscription(
             Float64,
@@ -399,6 +470,11 @@ class SteeringCommandMuxNode(Node):
             10,
         )
 
+        # ------------------------------------------------------------------
+        # Publicadores ROS 2
+        # ------------------------------------------------------------------
+        # El resultado principal es /steering_pos_cmd. También se publican estado,
+        # prioridad humana, heading hold y variables de diagnóstico.
         # Publicaciones.
         self.output_pub = self.create_publisher(
             Float64,
@@ -447,9 +523,13 @@ class SteeringCommandMuxNode(Node):
     def now_seconds(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+    # =========================================================================
+    # Callbacks de entrada
+    # =========================================================================
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
+    # Actualiza la petición manual de dirección y limita el valor al rango máximo.
     def human_steer_callback(self, msg: Float64) -> None:
         value = float(msg.data)
         if not math.isfinite(value):
@@ -462,10 +542,12 @@ class SteeringCommandMuxNode(Node):
         )
         self.human_stamp = self.now_seconds()
 
+    # Indica si existe una maniobra manual activa según la interfaz física.
     def manual_turn_active_callback(self, msg: Bool) -> None:
         self.manual_turn_active = bool(msg.data)
         self.manual_stamp = self.now_seconds()
 
+    # Recibe la dirección propuesta por el controlador de evasión.
     def assist_steer_callback(self, msg: Float64) -> None:
         value = float(msg.data)
         if not math.isfinite(value):
@@ -481,10 +563,14 @@ class SteeringCommandMuxNode(Node):
     def assist_active_callback(self, msg: Bool) -> None:
         self.assist_active = bool(msg.data)
 
+    # Conserva el aviso de parada únicamente para diagnóstico. No modifica
+    # directamente el movimiento del bastón.
     def stop_requested_callback(self, msg: Bool) -> None:
         # NO-BRAKE: nunca se convierte en una orden de movimiento.
         self.stop_requested = bool(msg.data)
 
+    # Extrae yaw, velocidad lineal y velocidad angular de /local_odom.
+    # También actualiza el estado moving mediante histéresis.
     def odom_callback(self, msg: Odometry) -> None:
         self.yaw = yaw_from_quaternion(msg.pose.pose.orientation)
 
@@ -518,9 +604,13 @@ class SteeringCommandMuxNode(Node):
     def odom_confidence_callback(self, msg: Float64) -> None:
         self.odom_confidence = float(msg.data)
 
+    # =========================================================================
+    # Funciones auxiliares
+    # =========================================================================
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    # Comprueba si una entrada ha sido recibida dentro del timeout permitido.
     def is_fresh(
         self,
         stamp: Optional[float],
@@ -532,6 +622,7 @@ class SteeringCommandMuxNode(Node):
             and (now_sec - stamp) <= timeout
         )
 
+    # Determina si la odometría puede utilizarse para control de rumbo.
     def orientation_usable(self, now_sec: float) -> bool:
         if not self.have_odom:
             return False
@@ -557,6 +648,7 @@ class SteeringCommandMuxNode(Node):
 
         return True
 
+    # Centraliza los cambios de estado del multiplexor.
     def change_state(
         self,
         new_state: str,
@@ -574,6 +666,7 @@ class SteeringCommandMuxNode(Node):
         self.state_started_at = now_sec
         self.settle_stable_since = None
 
+    # Memoriza el yaw actual como nuevo rumbo elegido por el usuario.
     def capture_heading_reference(
         self,
         now_sec: float,
@@ -591,6 +684,8 @@ class SteeringCommandMuxNode(Node):
             f'{reason}'
         )
 
+    # Invalida la referencia de rumbo cuando deja de ser fiable o el usuario
+    # inicia una nueva maniobra.
     def invalidate_heading_reference(
         self,
         reason: str,
@@ -604,6 +699,7 @@ class SteeringCommandMuxNode(Node):
         self.heading_reference_stamp = None
         self.initial_capture_since = None
 
+    # Determina si existe una petición manual válida y reciente.
     def manual_requested(self, now_sec: float) -> bool:
         active_topic_fresh = self.is_fresh(
             self.manual_stamp,
@@ -629,6 +725,7 @@ class SteeringCommandMuxNode(Node):
 
         return active_by_button or active_by_command
 
+    # Determina si la asistencia automática está activa y su comando es reciente.
     def assist_requested(self, now_sec: float) -> bool:
         return (
             self.assist_active
@@ -639,6 +736,7 @@ class SteeringCommandMuxNode(Node):
             )
         )
 
+    # Aplica límite angular y velocidad máxima de cambio a la orden del servo.
     def apply_output_dynamics(
         self,
         target: float,
@@ -663,6 +761,9 @@ class SteeringCommandMuxNode(Node):
             self.max_steer_rad,
         )
 
+    # Control PD de mantenimiento de rumbo:
+    #   - término proporcional sobre error angular;
+    #   - término derivativo sobre velocidad de yaw.
     def compute_heading_hold(
         self,
     ) -> tuple[float, float]:
@@ -697,9 +798,18 @@ class SteeringCommandMuxNode(Node):
 
         return target, error
 
+    # =========================================================================
+    # Bucle principal de arbitraje
+    # =========================================================================
     # ------------------------------------------------------------------
     # Control
     # ------------------------------------------------------------------
+    # Ejecuta la jerarquía completa de prioridades:
+    #   1. MANUAL_TURN
+    #   2. MANUAL_SETTLE
+    #   3. AUTONOMOUS_ASSIST
+    #   4. HEADING_HOLD
+    #   5. USER_GUIDED / ODOM_DEGRADED
     def control_callback(self) -> None:
         now = self.get_clock().now()
         now_sec = self.now_seconds()
@@ -710,6 +820,7 @@ class SteeringCommandMuxNode(Node):
         self.last_control_time = now
         dt = clamp(dt, 1e-3, 0.10)
 
+        # Evaluación de las fuentes disponibles y de la calidad de odometría.
         manual = self.manual_requested(now_sec)
         assist = self.assist_requested(now_sec)
         odom_ok = self.orientation_usable(now_sec)
@@ -719,6 +830,11 @@ class SteeringCommandMuxNode(Node):
         human_priority = False
         heading_hold_active = False
 
+        # --------------------------------------------------------------
+        # 1) Prioridad humana
+        # --------------------------------------------------------------
+        # Si existe una intención manual, la dirección humana pasa directamente
+        # al servo y anula temporalmente cualquier asistencia.
         # --------------------------------------------------------------
         # 1) Intención humana: máxima prioridad sobre la DIRECCIÓN.
         # --------------------------------------------------------------
@@ -743,6 +859,10 @@ class SteeringCommandMuxNode(Node):
             human_priority = True
 
         # --------------------------------------------------------------
+        # 2) Inicio del recentrado
+        # --------------------------------------------------------------
+        # Al desaparecer la orden manual comienza una fase de transición suave.
+        # --------------------------------------------------------------
         # 2) Al soltar la flecha/botón, empezar centrado.
         # --------------------------------------------------------------
         elif self.state == self.MANUAL_TURN:
@@ -761,6 +881,11 @@ class SteeringCommandMuxNode(Node):
             source = 'SETTLE_START'
             human_priority = True
 
+        # --------------------------------------------------------------
+        # 3) Recentrado y captura del nuevo rumbo
+        # --------------------------------------------------------------
+        # Se espera a que la rueda esté prácticamente centrada y el yaw sea estable
+        # antes de fijar la nueva referencia.
         # --------------------------------------------------------------
         # 3) Centrado progresivo y captura del nuevo rumbo.
         # --------------------------------------------------------------
@@ -843,6 +968,10 @@ class SteeringCommandMuxNode(Node):
                     )
 
         # --------------------------------------------------------------
+        # 4) Asistencia automática
+        # --------------------------------------------------------------
+        # Durante evasión o retorno se utiliza la orden procedente del controlador.
+        # --------------------------------------------------------------
         # 4) Evasión/retorno automático: solo dirección.
         # --------------------------------------------------------------
         elif assist:
@@ -861,6 +990,10 @@ class SteeringCommandMuxNode(Node):
 
             source = 'ASSIST_DIRECTION'
 
+        # --------------------------------------------------------------
+        # 5) Fin de asistencia
+        # --------------------------------------------------------------
+        # Si existe una referencia válida, se vuelve a mantener el rumbo humano.
         # --------------------------------------------------------------
         # 5) Fin de la evasión: recuperar rumbo humano previo.
         # --------------------------------------------------------------
@@ -908,6 +1041,10 @@ class SteeringCommandMuxNode(Node):
 
                 source = 'CENTER_AFTER_ASSIST'
 
+        # --------------------------------------------------------------
+        # 6) Mantenimiento de rumbo
+        # --------------------------------------------------------------
+        # Solo aplica correcciones mientras la odometría indica movimiento real.
         # --------------------------------------------------------------
         # 6) Mantenimiento de rumbo.
         #    Solo aplica correcciones cuando la odometría indica movimiento.
@@ -967,6 +1104,11 @@ class SteeringCommandMuxNode(Node):
                 source = 'HEADING_HOLD_MOVING'
                 heading_hold_active = True
 
+        # --------------------------------------------------------------
+        # 7) Sin referencia válida
+        # --------------------------------------------------------------
+        # La rueda permanece centrada y se espera a detectar un tramo recto y
+        # estable para capturar una nueva referencia.
         # --------------------------------------------------------------
         # 7) Sin referencia: rueda centrada.
         #    Se captura rumbo inicial cuando REALMENTE se detecta movimiento
@@ -1038,6 +1180,8 @@ class SteeringCommandMuxNode(Node):
                 'ODOM_STALE_TOO_LONG'
             )
 
+        # Aplicación final de inversión de signo y offset mecánico antes de
+        # publicar la orden de servo.
         servo_output = clamp(
             self.steer_sign * output
             + self.steer_offset_rad,
@@ -1092,6 +1236,13 @@ class SteeringCommandMuxNode(Node):
             self.get_logger().info(debug)
             self.last_debug_time = now
 
+
+# ============================================================================
+# Punto de entrada del nodo
+# ============================================================================
+# Inicializa ROS 2, crea el multiplexor y mantiene activo el bucle de control.
+# Antes de cerrar se intenta publicar una última orden de dirección centrada.
+# ============================================================================
 
 def main(args=None) -> None:
     rclpy.init(args=args)
