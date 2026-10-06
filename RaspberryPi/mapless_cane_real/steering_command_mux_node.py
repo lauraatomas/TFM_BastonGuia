@@ -140,7 +140,7 @@ class SteeringCommandMuxNode(Node):
         self.declare_parameter('control_rate_hz', 40.0)
         self.declare_parameter('input_timeout_s', 0.60)
         self.declare_parameter('odom_timeout_s', 0.80)
-        self.declare_parameter('max_steer_rad', 0.08)
+        self.declare_parameter('max_steer_rad', 0.50)
         self.declare_parameter('steer_sign', 1.0)
         self.declare_parameter('steer_offset_rad', 0.0)
 
@@ -152,7 +152,7 @@ class SteeringCommandMuxNode(Node):
         # Entrada humana.
         self.declare_parameter(
             'manual_enter_deadband_rad',
-            0.08,
+            0.05,
         )
         self.declare_parameter(
             'manual_slew_rate_rad_s',

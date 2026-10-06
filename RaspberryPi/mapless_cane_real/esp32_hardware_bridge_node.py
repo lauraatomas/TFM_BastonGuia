@@ -230,7 +230,7 @@ class Esp32HardwareBridgeNode(Node):
         # el cableado físico.
         self.declare_parameter(
             'max_human_steer_rad',
-            0.08,
+            0.50,
         )
         self.declare_parameter(
             'invert_turn_buttons',
@@ -238,7 +238,7 @@ class Esp32HardwareBridgeNode(Node):
         )
 
         # Servo: Raspberry manda RADIANES, NO microsegundos.
-        self.declare_parameter('max_steer_rad', 0.08)
+        self.declare_parameter('max_steer_rad', 0.50)
         self.declare_parameter('invert_servo', False)
 
         # ------------------------------------------------------------------
