@@ -288,6 +288,12 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('return_heading_tolerance_rad', 0.18)
         self.declare_parameter('return_stable_time_s', 0.25)
         self.declare_parameter('return_replan_front_m', 1.05)
+
+        # Tiempo durante el cual un obstáculo frontal debe permanecer detectado
+        # durante RETURN_LINE antes de interrumpir el retorno y comenzar una
+        # nueva evasión. Las situaciones de emergencia siguen siendo inmediatas.
+        self.declare_parameter('return_replan_confirm_time_s', 0.40)
+
         self.declare_parameter('return_side_guard_soft_m', 0.50)
         self.declare_parameter('return_side_guard_hard_m', 0.28)
         self.declare_parameter('return_side_away_steer_rad', 0.12)
@@ -340,6 +346,15 @@ class MaplessBypassControllerNode(Node):
         self.declare_parameter('emergency_side_soft_m', 0.48)
         self.declare_parameter('emergency_side_hard_m', 0.26)
         self.declare_parameter('emergency_min_escape_steer_rad', 0.20)
+
+        # Estabilización del escape cuando todos los arcos son inválidos.
+        # Se mantiene temporalmente el lado elegido para evitar alternancias
+        # izquierda/derecha provocadas por pequeñas variaciones entre frames.
+        self.declare_parameter('emergency_escape_hold_time_s', 0.80)
+
+        # Limita cuánto puede variar la magnitud del steer entre dos ciclos
+        # consecutivos de escape, sin reducir el máximo físico disponible.
+        self.declare_parameter('emergency_escape_max_step_rad', 0.10)
 
         # El latido de hardware puede exigirse en el sistema real y desactivarse
         # durante simulación.
@@ -464,6 +479,9 @@ class MaplessBypassControllerNode(Node):
         self.return_heading_tolerance_rad = float(gp('return_heading_tolerance_rad'))
         self.return_stable_time_s = float(gp('return_stable_time_s'))
         self.return_replan_front_m = float(gp('return_replan_front_m'))
+        self.return_replan_confirm_time_s = float(
+            gp('return_replan_confirm_time_s')
+        )
         self.return_side_guard_soft_m = float(gp('return_side_guard_soft_m'))
         self.return_side_guard_hard_m = float(gp('return_side_guard_hard_m'))
         self.return_side_away_steer_rad = float(gp('return_side_away_steer_rad'))
@@ -497,6 +515,12 @@ class MaplessBypassControllerNode(Node):
         self.emergency_side_soft_m = float(gp('emergency_side_soft_m'))
         self.emergency_side_hard_m = float(gp('emergency_side_hard_m'))
         self.emergency_min_escape_steer_rad = float(gp('emergency_min_escape_steer_rad'))
+        self.emergency_escape_hold_time_s = float(
+            gp('emergency_escape_hold_time_s')
+        )
+        self.emergency_escape_max_step_rad = float(
+            gp('emergency_escape_max_step_rad')
+        )
         self.require_hardware_alive = bool(gp('require_hardware_alive'))
         self.hardware_timeout_s = float(gp('hardware_timeout_s'))
 
@@ -617,6 +641,11 @@ class MaplessBypassControllerNode(Node):
         self.side_exit_reason = ''
         self.front_clear_since: Optional[float] = None
         self.return_stable_since: Optional[float] = None
+
+        # Marca temporal utilizada para confirmar que un obstáculo frontal
+        # durante RETURN_LINE es persistente y no una detección momentánea.
+        self.return_obstacle_since: Optional[float] = None
+
         self.return_best_abs_error = math.inf
         self.return_last_improvement_stamp: Optional[float] = None
         self.return_path_blocked = False
@@ -638,6 +667,11 @@ class MaplessBypassControllerNode(Node):
         self.theta_cmd = 0.0
         self.last_safe_steer = 0.0
         self.last_safe_steer_stamp: Optional[float] = None
+
+        # Memoria temporal usada exclusivamente cuando todos los arcos son
+        # inválidos. Evita invertir el sentido de escape entre frames.
+        self.emergency_escape_sign = 0
+        self.emergency_escape_sign_since: Optional[float] = None
         self.last_control_time = self.get_clock().now()
         self.last_debug_time = self.get_clock().now()
         self.startup_stamp = self.now_seconds()
@@ -1091,10 +1125,42 @@ class MaplessBypassControllerNode(Node):
         # el usuario controla dirección y velocidad; la asistencia solo se activa
         # si aparece un obstáculo dentro de la distancia de disparo.
         if self.state == self.USER_GUIDED:
+            # No iniciar una maniobra autónoma mientras el usuario está parado.
+            #
+            # La odometría RGB-D presenta pequeñas velocidades residuales incluso
+            # con el bastón completamente inmóvil. Se reutiliza el umbral de
+            # velocidad empleado para identificar avance estable del usuario.
+            #
+            # Un obstáculo puede seguir siendo detectado por cámara/sensores,
+            # pero mientras no exista avance real:
+            #   - se mantiene USER_GUIDED,
+            #   - el servo permanece centrado,
+            #   - no se entra en AVOID_OPEN.
+            # Confirmación temporal de movimiento real.
+            #
+            # La odometría RGB-D puede producir picos aislados de velocidad
+            # aunque el bastón esté completamente parado. Por eso no basta con
+            # comprobar una sola muestra. El usuario debe mantener una velocidad
+            # superior al umbral durante stable_heading_time_s antes de permitir
+            # el inicio de una evasión autónoma.
+            if self.speed >= self.stable_heading_min_speed_m_s:
+                if getattr(self, 'forward_motion_since', None) is None:
+                    self.forward_motion_since = now_sec
+            else:
+                self.forward_motion_since = None
+
+            moving_forward = (
+                self.forward_motion_since is not None
+                and (now_sec - self.forward_motion_since) >= self.stable_heading_time_s
+            )
+
             if not straight_observed and not obstacle_near:
                 self.set_warning('STRAIGHT_CORRIDOR_INSUFFICIENTLY_OBSERVED')
                 self.latch_haptic(self.HAPTIC_DANGER, 0.35)
                 return 0.0, 'WARN_CORRIDOR_NOT_OBSERVED_USER_CONTINUES', False
+
+            if obstacle_near and not moving_forward:
+                return 0.0, 'OBSTACLE_DETECTED_BUT_USER_STOPPED', False
 
             if obstacle_near:
                 # Obstacles never create or replace a route line.  The current
@@ -1122,7 +1188,16 @@ class MaplessBypassControllerNode(Node):
         if not self.valid_candidates():
             self.set_warning('NO_FULLY_VALID_ARC_EMERGENCY_ESCAPE')
             self.latch_haptic(self.HAPTIC_DANGER, 0.40)
-            return self.compute_emergency_escape_command(), 'WARN_NO_VALID_ARC_EMERGENCY_ESCAPE', True
+            return (
+                self.compute_emergency_escape_command(),
+                'WARN_NO_VALID_ARC_EMERGENCY_ESCAPE',
+                True,
+            )
+
+        # Si vuelve a existir al menos un arco completamente válido, termina
+        # el episodio de escape y se libera el signo memorizado.
+        self.emergency_escape_sign = 0
+        self.emergency_escape_sign_since = None
 
         # AVOID_OPEN:
         # apertura progresiva de la trayectoria hacia el lado elegido hasta
@@ -1247,16 +1322,54 @@ class MaplessBypassControllerNode(Node):
         # corrige progresivamente error lateral y angular hasta recuperar la línea
         # de referencia original del tramo.
         if self.state == self.RETURN_LINE:
-            if obstacle_near and self.front_collision_distance < self.return_replan_front_m:
-                if self.start_avoidance(now_sec, keep_reference_line=True):
-                    desired = self.compute_progressive_open_command(now_sec)
-                    return self.select_open_candidate(desired, emergency=emergency), 'NEW_OBSTACLE_INTERRUPTS_RETURN', True
-                self.set_warning('RETURN_BLOCKED_NO_DETOUR_SIDE_RETURN_AWARE_ESCAPE')
-                return (
-                    self.compute_return_command(),
-                    'WARN_RETURN_BLOCKED_RETURN_AWARE_ESCAPE',
-                    True,
+            return_obstacle_detected = (
+                obstacle_near
+                and self.front_collision_distance < self.return_replan_front_m
+            )
+
+            if return_obstacle_detected:
+                if self.return_obstacle_since is None:
+                    self.return_obstacle_since = now_sec
+
+                obstacle_confirmed = (
+                    (now_sec - self.return_obstacle_since)
+                    >= self.return_replan_confirm_time_s
                 )
+
+                # Una situación de emergencia interrumpe el retorno de forma
+                # inmediata. En condiciones normales se exige persistencia
+                # temporal para evitar que el mismo obstáculo recién superado,
+                # ruido puntual o geometría residual provoquen una nueva evasión.
+                if emergency or obstacle_confirmed:
+                    if self.start_avoidance(
+                        now_sec,
+                        keep_reference_line=True,
+                    ):
+                        desired = self.compute_progressive_open_command(
+                            now_sec
+                        )
+                        return (
+                            self.select_open_candidate(
+                                desired,
+                                emergency=emergency,
+                            ),
+                            'NEW_OBSTACLE_INTERRUPTS_RETURN',
+                            True,
+                        )
+
+                    self.set_warning(
+                        'RETURN_BLOCKED_NO_DETOUR_SIDE_RETURN_AWARE_ESCAPE'
+                    )
+                    return (
+                        self.compute_return_command(),
+                        'WARN_RETURN_BLOCKED_RETURN_AWARE_ESCAPE',
+                        True,
+                    )
+
+            else:
+                # Si desaparece antes del tiempo de confirmación, se considera
+                # una detección momentánea y el contador vuelve a empezar.
+                self.return_obstacle_since = None
 
             if not self.line_valid:
                 self.release_to_user(now_sec, reason='REFERENCE_LINE_INVALID')
@@ -1763,9 +1876,18 @@ class MaplessBypassControllerNode(Node):
             return
 
         if self.side_baseline_valid:
+            baseline_already_close = (
+                self.side_baseline_dist <= self.side_seen_absolute_m
+            )
+
             detected_now = (
                 distance <= self.side_seen_absolute_m
-                and distance <= (self.side_baseline_dist - self.side_seen_drop_m)
+                and (
+                    baseline_already_close
+                    or distance <= (
+                        self.side_baseline_dist - self.side_seen_drop_m
+                    )
+                )
             )
         else:
             detected_now = distance <= self.side_seen_absolute_m
@@ -2299,6 +2421,27 @@ class MaplessBypassControllerNode(Node):
             committed_sign = int(self.avoid_sign)
 
         required_sign = forced_sign if forced_sign != 0 else committed_sign
+        now_sec = self.now_seconds()
+
+        # Un peligro lateral real puede cambiar inmediatamente el sentido.
+        # Igualmente, si la maniobra AVOID/PASS ya tiene un lado comprometido,
+        # ese lado sigue teniendo prioridad.
+        if required_sign != 0:
+            if self.emergency_escape_sign != required_sign:
+                self.emergency_escape_sign = int(required_sign)
+                self.emergency_escape_sign_since = now_sec
+
+        # Si no existe una obligación geométrica concreta, mantener durante
+        # un breve intervalo el último signo elegido. Así un frame ligeramente
+        # mejor a izquierda y el siguiente ligeramente mejor a derecha no
+        # producen comandos alternantes.
+        elif (
+            self.emergency_escape_sign != 0
+            and self.emergency_escape_sign_since is not None
+            and (now_sec - self.emergency_escape_sign_since)
+            < self.emergency_escape_hold_time_s
+        ):
+            required_sign = int(self.emergency_escape_sign)
 
         if not options:
             # Reuse the last safe steering only if it does not violate the
@@ -2345,6 +2488,14 @@ class MaplessBypassControllerNode(Node):
         best = max(allowed_options, key=score)
         steer = float(best.steer)
 
+        # Si este ciclo todavía no tenía un signo obligatorio, el primer arco
+        # seleccionado inicia el periodo de compromiso temporal.
+        if required_sign == 0 and abs(steer) >= 0.015:
+            selected_sign = 1 if steer > 0.0 else -1
+            self.emergency_escape_sign = selected_sign
+            self.emergency_escape_sign_since = now_sec
+            required_sign = selected_sign
+
         if abs(steer) < self.emergency_min_escape_steer_rad:
             sign = required_sign
             if sign == 0:
@@ -2353,9 +2504,26 @@ class MaplessBypassControllerNode(Node):
                 sign = -1 if left < right else 1
             steer = sign * self.emergency_min_escape_steer_rad
 
-        return self.remember_safe_steer(
-            clamp(steer, -self.max_steer_rad, self.max_steer_rad)
+        target = clamp(
+            steer,
+            -self.max_steer_rad,
+            self.max_steer_rad,
         )
+
+        # Dentro del mismo lado de escape evitamos saltos bruscos de magnitud.
+        # No se aplica si hay que invertir realmente el signo por seguridad.
+        if (
+            abs(self.last_safe_steer) >= 0.03
+            and target * self.last_safe_steer > 0.0
+        ):
+            delta = clamp(
+                target - self.last_safe_steer,
+                -self.emergency_escape_max_step_rad,
+                self.emergency_escape_max_step_rad,
+            )
+            target = self.last_safe_steer + delta
+
+        return self.remember_safe_steer(target)
 
     # =========================================================================
     # Selección de arcos
@@ -2680,29 +2848,151 @@ class MaplessBypassControllerNode(Node):
 
     # Centraliza los cambios de estado y reinicia las variables temporales
     # correspondientes a cada transición.
+    # ------------------------------------------------------------------
+    # Logging compacto de navegación
+    # ------------------------------------------------------------------
+    def compact_side_distance(self) -> float:
+        """Distancia lateral más relevante para el estado actual."""
+        if self.object_side == 'LEFT' and self.side_left_valid:
+            return float(self.side_left_dist)
+
+        if self.object_side == 'RIGHT' and self.side_right_valid:
+            return float(self.side_right_dist)
+
+        candidates = []
+
+        if self.side_left_valid and math.isfinite(self.side_left_dist):
+            candidates.append(float(self.side_left_dist))
+
+        if self.side_right_valid and math.isfinite(self.side_right_dist):
+            candidates.append(float(self.side_right_dist))
+
+        if candidates:
+            return min(candidates)
+
+        return math.inf
+
+    @staticmethod
+    def compact_float(value: float, signed: bool = False) -> str:
+        if not math.isfinite(value):
+            return 'inf'
+
+        if signed:
+            return f'{value:+.3f}'
+
+        return f'{value:.3f}'
+
+    def compact_transition_reason(
+        self,
+        old_state: str,
+        new_state: str,
+    ) -> str:
+        reasons = {
+            (self.USER_GUIDED, self.AVOID_OPEN):
+                'FRONT_OBSTACLE',
+
+            (self.AVOID_OPEN, self.PASS_OBSTACLE):
+                'OPEN_COMPLETE',
+
+            (self.PASS_OBSTACLE, self.RETURN_LINE):
+                'OBSTACLE_CONFIRMED_BEHIND',
+
+            (self.RETURN_LINE, self.AVOID_OPEN):
+                'NEW_OBSTACLE_DURING_RETURN',
+
+            (self.USER_GUIDED, self.MANUAL_TURN):
+                'HUMAN_TURN_STARTED',
+        }
+
+        return reasons.get(
+            (old_state, new_state),
+            'STATE_TRANSITION',
+        )
+
+    def log_compact_state(
+        self,
+        old_state: str,
+        new_state: str,
+        reason: str,
+    ) -> None:
+        side = self.compact_side_distance()
+
+        self.get_logger().info(
+            'NAV_STATE | '
+            f'{old_state} -> {new_state} | '
+            f'reason={reason} | '
+            f'e_y={self.compact_float(self.lateral_error, signed=True)} | '
+            f'e_th={self.compact_float(self.heading_error, signed=True)} | '
+            f'front={self.compact_float(self.front_collision_distance)} | '
+            f'side={self.compact_float(side)} | '
+            f'steer={self.compact_float(self.theta_cmd, signed=True)}'
+        )
+
+    def log_compact_event(
+        self,
+        reason: str,
+    ) -> None:
+        side = self.compact_side_distance()
+
+        self.get_logger().warn(
+            'NAV_EVENT | '
+            f'reason={reason} | '
+            f'state={self.state} | '
+            f'e_y={self.compact_float(self.lateral_error, signed=True)} | '
+            f'e_th={self.compact_float(self.heading_error, signed=True)} | '
+            f'front={self.compact_float(self.front_collision_distance)} | '
+            f'side={self.compact_float(side)} | '
+            f'steer={self.compact_float(self.theta_cmd, signed=True)}'
+        )
+
+    # Centraliza los cambios de estado y genera una única línea compacta
+    # para cada transición.
     def change_state(self, new_state: str, now_sec: float) -> None:
-        if new_state != self.state:
-            self.get_logger().info(f'State: {self.state} -> {new_state}')
+        old_state = self.state
+
+        if new_state != old_state:
+            reason = self.compact_transition_reason(
+                old_state,
+                new_state,
+            )
+
+            self.log_compact_state(
+                old_state,
+                new_state,
+                reason,
+            )
+
+            # Se conserva también el mensaje histórico para compatibilidad
+            # con las herramientas de diagnóstico existentes.
+            self.get_logger().info(
+                f'State: {old_state} -> {new_state}'
+            )
+
         self.state = new_state
         self.state_start_time = now_sec
         self.state_start_x = self.x
         self.state_start_y = self.y
+
         if new_state != self.RETURN_LINE:
             self.return_stable_since = None
+
         if new_state == self.PASS_OBSTACLE:
             self.side_lost_since = None
+
             if not self.side_exit_confirmed:
                 self.side_invalid_since = None
+
         if new_state == self.RETURN_LINE:
             self.front_clear_since = None
+            self.return_obstacle_since = None
             self.return_target_valid = False
             self.return_best_abs_error = abs(self.lateral_error)
             self.return_last_improvement_stamp = now_sec
             self.return_path_blocked = False
             self.return_recovery_active = False
 
-    # Devuelve el control al usuario al finalizar la asistencia o ante una
-    # condición que invalida la maniobra.
+    # Devuelve el control al usuario y registra la causa REAL que ha provocado
+    # la salida de la asistencia.
     def release_to_user(
         self,
         now_sec: float,
@@ -2710,22 +3000,33 @@ class MaplessBypassControllerNode(Node):
         preserve_route_line: bool = True,
     ) -> None:
         previous = self.state
+
+        # Registrar antes de limpiar la memoria de maniobra para conservar
+        # distancia lateral, error respecto a línea y último steer útiles.
+        if previous != self.USER_GUIDED:
+            self.log_compact_state(
+                previous,
+                self.USER_GUIDED,
+                str(reason),
+            )
+
         self.state = self.USER_GUIDED
         self.state_start_time = now_sec
         self.state_start_x = self.x
         self.state_start_y = self.y
+
         if not preserve_route_line:
             self.line_valid = False
             self.route_line_source = 'NONE'
+
         self.reactive_only_mode = False
         self.clear_manoeuvre_memory()
+
         self.get_logger().info(
             f'State: {previous} -> USER_GUIDED ({reason}) '
             f'route_line_preserved={preserve_route_line and self.line_valid}'
         )
 
-    # Limita desviaciones angulares excesivas durante asistencia automática y
-    # evita que el sistema derive hacia una maniobra equivalente a un giro en U.
     def apply_autonomous_turn_guard(
         self,
         target: float,
@@ -2884,6 +3185,7 @@ class MaplessBypassControllerNode(Node):
         if self.warning_reason == self.last_warning_reason:
             return
         if self.warning_reason:
+            self.log_compact_event(self.warning_reason)
             self.get_logger().warn(
                 f'SAFETY WARNING (no brake): {self.warning_reason}. '
                 'Human push remains active; servo guidance continues.'

@@ -471,6 +471,14 @@ class RgbdImuLocalOdometryNode(Node):
         self.latest_depth: Optional[Image] = None
         self.latest_color_stamp = 0.0
         self.latest_depth_stamp = 0.0
+
+        # Pequeñas colas temporales para emparejar RGB y profundidad por
+        # timestamp real, en lugar de utilizar simplemente el último mensaje
+        # recibido de cada topic.
+        self.color_buffer = []
+        self.depth_buffer = []
+        self.rgbd_buffer_size = 8
+
         self.last_processed_stamp = -1.0
 
         # ------------------------------------------------------------------
@@ -622,12 +630,24 @@ class RgbdImuLocalOdometryNode(Node):
     # Inputs
     # ------------------------------------------------------------------
     def color_callback(self, msg: Image) -> None:
+        stamp = stamp_to_seconds(msg.header.stamp) or self.now_seconds()
+
         self.latest_color = msg
-        self.latest_color_stamp = stamp_to_seconds(msg.header.stamp) or self.now_seconds()
+        self.latest_color_stamp = stamp
+
+        self.color_buffer.append((stamp, msg))
+        if len(self.color_buffer) > self.rgbd_buffer_size:
+            self.color_buffer.pop(0)
 
     def depth_callback(self, msg: Image) -> None:
+        stamp = stamp_to_seconds(msg.header.stamp) or self.now_seconds()
+
         self.latest_depth = msg
-        self.latest_depth_stamp = stamp_to_seconds(msg.header.stamp) or self.now_seconds()
+        self.latest_depth_stamp = stamp
+
+        self.depth_buffer.append((stamp, msg))
+        if len(self.depth_buffer) > self.rgbd_buffer_size:
+            self.depth_buffer.pop(0)
 
     def camera_info_callback(self, msg: CameraInfo) -> None:
         self.camera_info = msg
@@ -749,22 +769,75 @@ class RgbdImuLocalOdometryNode(Node):
     #   6. aplica restricciones cinemáticas y de plausibilidad;
     #   7. actualiza pose, confianza, covarianza y keyframe.
     def process_latest_pair(self) -> None:
-        if self.camera_info is None or self.latest_color is None or self.latest_depth is None:
+        if (
+            self.camera_info is None
+            or not self.color_buffer
+            or not self.depth_buffer
+        ):
             self.publish_state('WAITING_FOR_RGBD_OR_CAMERA_INFO')
             return
 
-        sync_error = abs(self.latest_color_stamp - self.latest_depth_stamp)
-        pair_stamp = max(self.latest_color_stamp, self.latest_depth_stamp)
+        # Buscar, entre los mensajes recientes, la pareja RGB-D con menor
+        # diferencia temporal. Solo se consideran parejas posteriores a la
+        # última ya procesada.
+        best_pair = None
+        best_sync_error = math.inf
+
+        for color_stamp, color_msg in self.color_buffer:
+            for depth_stamp, depth_msg in self.depth_buffer:
+                pair_stamp_candidate = max(color_stamp, depth_stamp)
+
+                if pair_stamp_candidate <= self.last_processed_stamp:
+                    continue
+
+                sync_error_candidate = abs(color_stamp - depth_stamp)
+
+                if sync_error_candidate < best_sync_error:
+                    best_sync_error = sync_error_candidate
+                    best_pair = (
+                        color_stamp,
+                        color_msg,
+                        depth_stamp,
+                        depth_msg,
+                        pair_stamp_candidate,
+                    )
+
+        if best_pair is None:
+            return
+
+        (
+            color_stamp,
+            color_msg,
+            depth_stamp,
+            depth_msg,
+            pair_stamp,
+        ) = best_pair
+
+        sync_error = abs(color_stamp - depth_stamp)
+
         if sync_error > self.max_sync_error_s:
             self.degrade_confidence(0.78)
-            self.publish_state(f'RGBD_NOT_SYNCHRONIZED dt={sync_error:.3f}s')
+            self.publish_state(
+                f'RGBD_NOT_SYNCHRONIZED dt={sync_error:.3f}s'
+            )
             return
-        if pair_stamp <= self.last_processed_stamp:
-            return
+
         self.last_processed_stamp = pair_stamp
 
-        color = image_to_bgr8(self.latest_color)
-        depth_m = image_to_depth_metres(self.latest_depth)
+        # Descartar únicamente mensajes anteriores o iguales a la pareja
+        # consumida. Los más recientes permanecen disponibles para el siguiente
+        # ciclo de procesamiento.
+        self.color_buffer = [
+            item for item in self.color_buffer
+            if item[0] > color_stamp
+        ]
+        self.depth_buffer = [
+            item for item in self.depth_buffer
+            if item[0] > depth_stamp
+        ]
+
+        color = image_to_bgr8(color_msg)
+        depth_m = image_to_depth_metres(depth_msg)
         if color is None or depth_m is None or color.shape[:2] != depth_m.shape[:2]:
             self.valid = False
             self.publish_state('IMAGE_CONVERSION_OR_ALIGNMENT_ERROR')

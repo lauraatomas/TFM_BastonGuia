@@ -150,6 +150,15 @@ class Esp32HardwareBridgeNode(Node):
         self.declare_parameter('reconnect_period_s', 1.0)
         self.declare_parameter('serial_timeout_s', 0.05)
         self.declare_parameter('hardware_timeout_s', 0.40)
+
+        # Tiempo máximo que permitimos que el puerto esté abierto sin recibir
+        # ninguna trama TEL2. Si se supera, se fuerza cierre y reconexión.
+        self.declare_parameter('initial_telemetry_timeout_s', 4.0)
+
+        # Si durante el funcionamiento desaparece TEL2 durante demasiado
+        # tiempo, también se fuerza una reconexión serie.
+        self.declare_parameter('telemetry_reconnect_timeout_s', 2.0)
+
         self.declare_parameter('command_rate_hz', 25.0)
         self.declare_parameter('telemetry_log_period_s', 1.0)
 
@@ -253,6 +262,12 @@ class Esp32HardwareBridgeNode(Node):
         self.reconnect_period_s = float(gp('reconnect_period_s'))
         self.serial_timeout_s = float(gp('serial_timeout_s'))
         self.hardware_timeout_s = float(gp('hardware_timeout_s'))
+        self.initial_telemetry_timeout_s = float(
+            gp('initial_telemetry_timeout_s')
+        )
+        self.telemetry_reconnect_timeout_s = float(
+            gp('telemetry_reconnect_timeout_s')
+        )
         self.telemetry_log_period_s = float(
             gp('telemetry_log_period_s')
         )
@@ -317,6 +332,7 @@ class Esp32HardwareBridgeNode(Node):
         # Marcas temporales utilizadas para gestionar la reconexión,
         # la supervisión de actividad del hardware y la generación de logs.
         self.last_connect_attempt = 0.0
+        self.connected_at: Optional[float] = None
         self.last_telemetry_stamp: Optional[float] = None
         self.last_log_stamp = 0.0
 
@@ -496,6 +512,10 @@ class Esp32HardwareBridgeNode(Node):
             with self.serial_lock:
                 self.serial_port = port
 
+            # Inicio de una nueva sesión serie.
+            self.connected_at = now
+            self.last_telemetry_stamp = None
+
             self.stop_event.clear()
             self.read_thread = threading.Thread(
                 target=self.read_loop,
@@ -519,6 +539,9 @@ class Esp32HardwareBridgeNode(Node):
         with self.serial_lock:
             port = self.serial_port
             self.serial_port = None
+
+        self.connected_at = None
+        self.last_telemetry_stamp = None
 
         if port is not None:
             try:
@@ -545,8 +568,18 @@ class Esp32HardwareBridgeNode(Node):
 
             try:
                 raw = port.readline()
-            except (SerialException, OSError) as exc:
-                self.disconnect(str(exc))
+
+            except (SerialException, OSError, TypeError) as exc:
+                # Si el watchdog cierra el puerto mientras readline()
+                # está bloqueado, pyserial puede lanzar TypeError.
+                # En ese caso este hilo termina limpiamente y la
+                # reconexión creará un hilo nuevo.
+                with self.serial_lock:
+                    same_port = self.serial_port is port
+
+                if same_port:
+                    self.disconnect(str(exc))
+
                 return
 
             if not raw:
@@ -777,10 +810,134 @@ class Esp32HardwareBridgeNode(Node):
     # Este callback mantiene activo el enlace con el ESP32, genera la señal
     # /hardware_alive, traduce los pulsadores físicos a topics ROS y transmite
     # las órdenes de dirección y háptica.
+    # Recuperación automática específica para el ESP32-S3 conectado
+    # mediante USB-Serial/JTAG.
+    #
+    # En determinadas secuencias de encendido el dispositivo USB aparece y
+    # permite abrir el puerto, pero el firmware no comienza a transmitir TEL2.
+    # En ese caso cerrar y volver a abrir el puerto no es suficiente.
+    #
+    # La secuencia usb-reset + watchdog-reset de esptool fuerza un reset
+    # completo del ESP32-S3 y permite que el firmware vuelva a arrancar.
+    def recover_esp32_with_watchdog_reset(self, now: float) -> bool:
+
+        import subprocess
+
+        # Evita lanzar resets continuamente si por cualquier motivo la
+        # recuperación no funciona al primer intento.
+        reset_cooldown_s = 12.0
+
+        last_reset = getattr(
+            self,
+            '_last_watchdog_reset_attempt',
+            0.0,
+        )
+
+        if (
+            last_reset > 0.0
+            and (now - last_reset) < reset_cooldown_s
+        ):
+            remaining = reset_cooldown_s - (now - last_reset)
+
+            self.get_logger().warn(
+                'ESP32 autoreset en cooldown '
+                f'({remaining:.1f}s restantes).'
+            )
+            return False
+
+        self._last_watchdog_reset_attempt = now
+
+        esptool_path = '/home/luis/esptool_env/bin/esptool'
+
+        command = [
+            esptool_path,
+            '--chip', 'esp32s3',
+            '--port', self.serial_device,
+            '--before', 'usb-reset',
+            '--after', 'watchdog-reset',
+            '--no-stub',
+            'read-mac',
+        ]
+
+        self.get_logger().warn(
+            'ESP32 sin TEL2 tras el arranque. '
+            'Ejecutando USB watchdog-reset automático...'
+        )
+
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=15.0,
+                check=False,
+            )
+
+        except subprocess.TimeoutExpired:
+            self.get_logger().error(
+                'ESP32 watchdog-reset: esptool excedió 15 s.'
+            )
+            return False
+
+        except (OSError, FileNotFoundError) as exc:
+            self.get_logger().error(
+                f'ESP32 watchdog-reset: no se pudo ejecutar esptool: {exc}'
+            )
+            return False
+
+        output = (result.stdout or '').strip()
+
+        if result.returncode != 0:
+            self.get_logger().error(
+                'ESP32 watchdog-reset falló '
+                f'(returncode={result.returncode}). '
+                f'Salida: {output[-800:]}'
+            )
+            return False
+
+        self.get_logger().warn(
+            'ESP32 watchdog-reset completado correctamente. '
+            'Esperando reenumeración USB y nueva conexión.'
+        )
+
+        return True
+
+
     def timer_cb(self) -> None:
 
         now = self.now_seconds()
         self.connect_if_needed(now)
+
+        # --------------------------------------------------------------
+        # Watchdog de comunicación serie
+        # --------------------------------------------------------------
+
+        # Puerto abierto pero todavía no ha llegado ninguna TEL2.
+        if (
+            self.serial_port is not None
+            and self.connected_at is not None
+            and self.last_telemetry_stamp is None
+            and (now - self.connected_at) > self.initial_telemetry_timeout_s
+        ):
+            # El puerto puede estar correctamente abierto pero el ESP32-S3
+            # haberse quedado sin arrancar el firmware. Primero se libera el
+            # puerto y después se fuerza el mismo watchdog-reset que se ha
+            # validado manualmente con esptool.
+            self.disconnect('WATCHDOG_NO_INITIAL_TEL2')
+            self.recover_esp32_with_watchdog_reset(now)
+            return
+
+        # La comunicación funcionaba, pero TEL2 ha dejado de llegar.
+        if (
+            self.serial_port is not None
+            and self.last_telemetry_stamp is not None
+            and
+            (now - self.last_telemetry_stamp)
+            > self.telemetry_reconnect_timeout_s
+        ):
+            self.disconnect('WATCHDOG_TELEMETRY_LOST')
+            return
 
         # El hardware se considera operativo únicamente cuando el puerto está
         # abierto y se ha recibido telemetría dentro del tiempo máximo permitido.
