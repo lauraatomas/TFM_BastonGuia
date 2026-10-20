@@ -547,6 +547,7 @@ class RgbdImuLocalOdometryNode(Node):
         self.last_inlier_count = 0
         self.last_estimation_method = 'NONE'
         self.last_estimation_residual = math.inf
+        self.last_rejection_reasons = []
         self.last_effective_translation_scale = self.translation_scale_straight
         self.last_motion_curvature = 0.0
         self.last_arc_lateral_residual = 0.0
@@ -855,6 +856,7 @@ class RgbdImuLocalOdometryNode(Node):
         self.last_inlier_count = 0
         self.last_estimation_method = 'NONE'
         self.last_estimation_residual = math.inf
+        self.last_rejection_reasons = []
         if self.publish_debug_images:
             scaled_color = cv2.resize(
                 color, (gray.shape[1], gray.shape[0]),
@@ -919,7 +921,7 @@ class RgbdImuLocalOdometryNode(Node):
             self.propagate_during_visual_loss(pair_stamp)
             self.angular_speed = self.last_gyro_z if imu_fresh else 0.0
             self.degrade_confidence(0.68)
-            if keyframe_age >= 1.8 * self.keyframe_max_age_s:
+            if keyframe_age >= self.keyframe_max_age_s:
                 self.install_keyframe(
                     depth_scaled,
                     keypoints,
@@ -930,7 +932,15 @@ class RgbdImuLocalOdometryNode(Node):
                     self.yaw,
                 )
             self.update_output_velocity(pair_stamp)
-            self.publish_state('VISUAL_ODOMETRY_REJECTED_HOLD_TRANSLATION')
+            rejection_detail = (
+                ';'.join(self.last_rejection_reasons)
+                if self.last_rejection_reasons
+                else 'NO_SPECIFIC_REASON'
+            )
+            self.publish_state(
+                'VISUAL_ODOMETRY_REJECTED_HOLD_TRANSLATION'
+                f' | VO_REJECT={rejection_detail}'
+            )
             return
 
         (
@@ -1263,7 +1273,7 @@ class RgbdImuLocalOdometryNode(Node):
                     result = self.convert_camera_transform(
                         r_cur_prev,
                         t_cur_prev,
-                        len(good),
+                        len(previous_points),
                         inliers,
                         rmse,
                         'RGBD_IMU_FIXED_ROTATION',
@@ -1285,7 +1295,7 @@ class RgbdImuLocalOdometryNode(Node):
                 result = self.convert_camera_transform(
                     r_cur_prev,
                     t_cur_prev,
-                    len(good),
+                    len(previous_points),
                     inliers,
                     rmse,
                     'RGBD_3D3D_KEYFRAME',
@@ -1297,12 +1307,15 @@ class RgbdImuLocalOdometryNode(Node):
                     return result
 
         if len(pnp_object) < self.min_matches:
+            self.last_rejection_reasons.append(
+                f'PNP_TOO_FEW_POINTS={len(pnp_object)}/{self.min_matches}'
+            )
             return None
         result = self.estimate_pnp(
             np.asarray(pnp_object, dtype=np.float32),
             np.asarray(pnp_image, dtype=np.float32),
             k_matrix,
-            len(good),
+            len(pnp_object),
         )
         if result is not None:
             self.last_inlier_count = int(result[5])
@@ -1328,6 +1341,9 @@ class RgbdImuLocalOdometryNode(Node):
         """
         count = prev_points.shape[0]
         if count < self.min_3d3d_matches:
+            self.last_rejection_reasons.append(
+                f'FIXED_TOO_FEW_3D={count}/{self.min_3d3d_matches}'
+            )
             return None
 
         c = math.cos(delta_yaw_base)
@@ -1360,9 +1376,15 @@ class RgbdImuLocalOdometryNode(Node):
             mask = residuals <= threshold
             inlier_count = int(np.count_nonzero(mask))
             if inlier_count < self.min_inliers:
+                self.last_rejection_reasons.append(
+                    f'FIXED_INLIERS={inlier_count}/{count}'
+                )
                 return None
             inlier_ratio = inlier_count / max(count, 1)
             if inlier_ratio < self.min_inlier_ratio:
+                self.last_rejection_reasons.append(
+                    f'FIXED_RATIO={inlier_ratio:.2f}<{self.min_inlier_ratio:.2f}'
+                )
                 return None
             translation_cur_prev = np.median(offsets[mask], axis=0)
 
@@ -1372,6 +1394,9 @@ class RgbdImuLocalOdometryNode(Node):
         )
         rmse = float(np.sqrt(np.mean(np.square(residuals))))
         if rmse > self.fixed_rotation_max_rmse_m:
+            self.last_rejection_reasons.append(
+                f'FIXED_RMSE={rmse:.4f}>{self.fixed_rotation_max_rmse_m:.4f}'
+            )
             return None
         return (
             rotation_cur_prev,
@@ -1418,9 +1443,15 @@ class RgbdImuLocalOdometryNode(Node):
                 best_rmse = rmse
 
         if best_mask is None or best_count < self.min_inliers:
+            self.last_rejection_reasons.append(
+                f'RIGID_INLIERS={best_count}/{count}'
+            )
             return None
         inlier_ratio = best_count / max(count, 1)
         if inlier_ratio < self.min_inlier_ratio:
+            self.last_rejection_reasons.append(
+                f'RIGID_RATIO={inlier_ratio:.2f}<{self.min_inlier_ratio:.2f}'
+            )
             return None
 
         refined = self.rigid_svd(
@@ -1428,6 +1459,7 @@ class RgbdImuLocalOdometryNode(Node):
             cur_points[best_mask],
         )
         if refined is None:
+            self.last_rejection_reasons.append('RIGID_SVD_FAILED')
             return None
         rotation, translation = refined
         predicted = (rotation @ prev_points[best_mask].T).T + translation
@@ -1437,6 +1469,9 @@ class RgbdImuLocalOdometryNode(Node):
         )
         rmse = float(np.sqrt(np.mean(np.square(residual_vector))))
         if rmse > self.rigid_max_rmse_m:
+            self.last_rejection_reasons.append(
+                f'RIGID_RMSE={rmse:.4f}>{self.rigid_max_rmse_m:.4f}'
+            )
             return None
         return rotation, translation, best_count, rmse
 
@@ -1487,15 +1522,21 @@ class RgbdImuLocalOdometryNode(Node):
             flags=cv2.SOLVEPNP_EPNP,
         )
         if not success or inliers is None:
+            self.last_rejection_reasons.append('PNP_RANSAC_FAILED')
             return None
 
         inlier_indices = inliers.reshape(-1)
         inlier_count = int(inlier_indices.size)
         inlier_ratio = inlier_count / max(object_points.shape[0], 1)
-        if (
-            inlier_count < self.min_inliers
-            or inlier_ratio < self.min_inlier_ratio
-        ):
+        if inlier_count < self.min_inliers:
+            self.last_rejection_reasons.append(
+                f'PNP_INLIERS={inlier_count}/{object_points.shape[0]}'
+            )
+            return None
+        if inlier_ratio < self.min_inlier_ratio:
+            self.last_rejection_reasons.append(
+                f'PNP_RATIO={inlier_ratio:.2f}<{self.min_inlier_ratio:.2f}'
+            )
             return None
 
         refined, refined_rvec, refined_tvec = cv2.solvePnP(
@@ -1525,6 +1566,9 @@ class RgbdImuLocalOdometryNode(Node):
         )
         rmse = float(np.sqrt(np.mean(np.square(residuals))))
         if rmse > self.pnp_max_rmse_px:
+            self.last_rejection_reasons.append(
+                f'PNP_RMSE={rmse:.2f}>{self.pnp_max_rmse_px:.2f}px'
+            )
             return None
 
         rotation, _ = cv2.Rodrigues(rvec)
@@ -1582,9 +1626,20 @@ class RgbdImuLocalOdometryNode(Node):
             )
         )
 
-        if math.hypot(delta_forward, delta_left) > self.max_translation_per_frame_m:
+        translation_norm = math.hypot(delta_forward, delta_left)
+
+        if translation_norm > self.max_translation_per_frame_m:
+            self.last_rejection_reasons.append(
+                f'{method}_TRANSLATION={translation_norm:.3f}>'
+                f'{self.max_translation_per_frame_m:.3f}'
+            )
             return None
+
         if abs(delta_yaw) > self.max_yaw_per_frame_rad:
+            self.last_rejection_reasons.append(
+                f'{method}_YAW={abs(delta_yaw):.3f}>'
+                f'{self.max_yaw_per_frame_rad:.3f}'
+            )
             return None
 
         inlier_ratio = inlier_count / max(match_count, 1)
